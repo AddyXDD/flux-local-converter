@@ -1,4 +1,4 @@
-# FLUX — Local File Converter
+# FLUX - Local File Converter
 
 FLUX is a compact Windows desktop widget built with Tauri 2, Rust, React, and TypeScript. It is not Electron, a website, or a local web server. The interface and conversion code are packaged with the app. WebView2 is the Windows rendering runtime and the installer bundles its offline runtime installer.
 
