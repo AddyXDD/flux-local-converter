@@ -1,0 +1,44 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "FLUX",
+  "version": "0.1.2",
+  "identifier": "app.flux.localconverter",
+  "build": { "beforeDevCommand": "npm run dev", "devUrl": "http://localhost:5173", "beforeBuildCommand": "npm run build && npm run build:context-menu", "beforeBundleCommand": "powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/embed-shell-identity.ps1", "frontendDist": "../dist" },
+  "app": {
+    "windows": [{
+      "label": "main", "title": "FLUX", "width": 220, "height": 220,
+      "minWidth": 220, "minHeight": 220, "maxWidth": 220, "maxHeight": 220, "resizable": false,
+      "decorations": false, "alwaysOnTop": false, "center": false, "x": 20, "y": 60,
+      "visible": false, "focus": false, "skipTaskbar": true, "visibleOnAllWorkspaces": true,
+      "dragDropEnabled": true, "transparent": true, "backgroundColor": "#00000000", "shadow": false,
+      "noRedirectionBitmap": true
+    }],
+    "security": { "csp": "default-src 'self' blob: data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'" }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "resources": {
+      "flux-context-menu/target/release/flux_context_menu.dll": "flux-context-menu.dll",
+      "flux-context-menu/sparse/FluxLocalConverterShell.msix": "FluxLocalConverterShell.msix",
+      "flux-context-menu/sparse/FluxLocalConverterShell.cer": "FluxLocalConverterShell.cer",
+      "flux-context-menu/scripts/Register-ShellExtension.ps1": "Register-ShellExtension.ps1",
+      "flux-context-menu/scripts/Unregister-ShellExtension.ps1": "Unregister-ShellExtension.ps1",
+      "flux-context-menu/scripts/Trust-ShellExtensionCertificate.ps1": "Trust-ShellExtensionCertificate.ps1",
+      "flux-context-menu/sparse/Assets/StoreLogo.png": "Assets/StoreLogo.png",
+      "flux-context-menu/sparse/Assets/MedTile.png": "Assets/MedTile.png",
+      "flux-context-menu/sparse/Assets/AppList.png": "Assets/AppList.png"
+    },
+    "shortDescription": "Private local file converter",
+    "category": "Utility",
+    "windows": {
+      "webviewInstallMode": { "type": "offlineInstaller", "silent": true },
+      "digestAlgorithm": "sha256",
+      "signCommand": {
+        "cmd": "powershell",
+        "args": ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", "../scripts/sign-binary.ps1", "%1"]
+      },
+      "nsis": { "installMode": "currentUser", "installerHooks": "./windows/hooks.nsh" }
+    }
+  }
+}

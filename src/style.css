@@ -1,0 +1,52 @@
+:root {
+  font-family: 'DM Sans', 'Segoe UI', system-ui, sans-serif;
+  color: #292735;
+  background: transparent;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  font-optical-sizing: auto;
+  font-size: 13px;
+}
+
+* { box-sizing: border-box; }
+html, body, #root { width: 100%; height: 100%; min-width: 0; min-height: 0; margin: 0; overflow: hidden; background: transparent; }
+body { padding: 0; }
+button, input { font: inherit; }
+
+.desktop-surface,
+.donut-app { width: 100%; height: 100%; display: grid; place-items: center; overflow: hidden; background: transparent; }
+.donut { display: block; width: 100%; height: 100%; overflow: visible; user-select: none; -webkit-user-select: none; cursor: grab; touch-action: none; }
+.donut:active { cursor: grabbing; }
+.donut-aura { fill: url(#ring-wash); opacity: .84; transition: fill .25s ease, opacity .25s ease; }
+.donut-outline { fill: none; stroke: #ffffff; stroke-width: 1.5; opacity: .92; }
+.donut-slice { outline: none; }
+.donut-slice.convertible { cursor: pointer; }
+.donut-slice path { transition: fill .16s ease, stroke .16s ease, filter .16s ease; }
+.donut-slice:hover path,
+.donut-slice:focus-visible path { fill: #7c6cdf; stroke: #7160d2; filter: brightness(1.04); }
+.donut-slice:hover .donut-label,
+.donut-slice:focus-visible .donut-label { fill: #fff; }
+.donut-label { fill: #3c3a49; font: 700 12px 'DM Sans', 'Segoe UI', sans-serif; letter-spacing: .035em; pointer-events: none; }
+
+.donut-center { cursor: grab; outline: none; }
+.donut-center.center-action { cursor: pointer; }
+.donut-center-disc { fill: url(#center-wash); stroke: #fff; stroke-width: 2.5; transition: stroke .18s ease, fill .18s ease; }
+.donut-center:hover .donut-center-disc,
+.donut-center:focus-visible .donut-center-disc { stroke: #b3a9ed; }
+.donut-center-primary { fill: #312e3c; font: 800 15px 'DM Sans', 'Segoe UI', sans-serif; letter-spacing: .035em; pointer-events: none; }
+.donut-center-secondary { fill: #4c485a; font: 650 11px 'DM Sans', 'Segoe UI', sans-serif; letter-spacing: .025em; pointer-events: none; }
+.donut-center-hint { fill: #827d91; font: 650 9px 'DM Sans', 'Segoe UI', sans-serif; letter-spacing: .055em; pointer-events: none; }
+.flux-mark path { fill: none; stroke: #7969dc; stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; }
+.move-grip circle { fill: #a7a1b9; }
+.move-hint { fill: #aaa6b5; font: 700 8px 'DM Sans', 'Segoe UI', sans-serif; letter-spacing: .11em; pointer-events: none; }
+
+.is-standby:not(.is-dragging) .donut-aura { animation: idle-glow 6s ease-in-out infinite; }
+.is-dragging .donut-aura { fill: #e9e5ff; opacity: 1; }
+.is-dragging .donut-outline { stroke: #8b7ce3; stroke-width: 2.4; }
+.is-dragging .donut-center-disc { fill: #f6f4ff; stroke: #a99eed; }
+.is-dragging .move-grip circle { fill: #7969dc; }
+
+.hidden-input,.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
+@keyframes idle-glow { 0%, 100% { opacity: .72; } 50% { opacity: .96; } }
+@media (prefers-reduced-motion: reduce) { .is-standby:not(.is-dragging) .donut-aura { animation: none; } .donut-slice path,.donut-center-disc { transition: none; } }
