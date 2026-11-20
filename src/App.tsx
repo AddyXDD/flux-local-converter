@@ -40,6 +40,46 @@ function blobToBase64(blob: Blob): Promise<string> {
   });
 }
 
+const OUTPUT_CHUNK_BYTES = 512 * 1024;
+
+function yieldToUi(): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, 0));
+}
+
+async function writeOutputInChunks(
+  blob: Blob,
+  path: string,
+  sourcePath: string | null,
+  signal: AbortSignal,
+  onProgress: (message: string) => void,
+): Promise<void> {
+  const sessionId = await invoke<string>('begin_output_write', {
+    path,
+    sourcePath,
+    totalBytes: blob.size,
+  });
+  try {
+    let nextProgress = 10;
+    for (let offset = 0; offset < blob.size; offset += OUTPUT_CHUNK_BYTES) {
+      if (signal.aborted) throw new DOMException('Export canceled.', 'AbortError');
+      const end = Math.min(blob.size, offset + OUTPUT_CHUNK_BYTES);
+      const dataBase64 = await blobToBase64(blob.slice(offset, end));
+      await invoke('append_output_chunk', { sessionId, offset, dataBase64 });
+      const percent = Math.floor((end / blob.size) * 100);
+      if (percent >= nextProgress) {
+        onProgress(`SAVING FILE ${percent}%`);
+        nextProgress = Math.floor(percent / 10) * 10 + 10;
+      }
+      await yieldToUi();
+    }
+    if (signal.aborted) throw new DOMException('Export canceled.', 'AbortError');
+    await invoke('finish_output_write', { sessionId });
+  } catch (error) {
+    await invoke('abort_output_write', { sessionId }).catch(() => undefined);
+    throw error;
+  }
+}
+
 export default function App() {
   const [files, setFiles] = useState<FluxFile[]>([]);
   const [busy, setBusy] = useState(false);
@@ -230,6 +270,7 @@ export default function App() {
     const controller = new AbortController();
     cancelController.current = controller;
     const successes: string[] = [];
+    const savedPaths: string[] = [];
     const failures: string[] = [];
     for (const file of convertible) {
       if (controller.signal.aborted) break;
@@ -249,12 +290,14 @@ export default function App() {
         if (blob.size > 32 * 1024 * 1024) throw new Error('Converted output exceeds the safe 32 MB limit.');
         if (isTauri()) {
           if (!outputPath) throw new Error('No output location was selected.');
-          const dataBase64 = await blobToBase64(blob);
-          await invoke('write_output_atomic', {
-            path: outputPath,
-            sourcePath: file.sourcePath ?? null,
-            dataBase64,
-          });
+          await writeOutputInChunks(
+            blob,
+            outputPath,
+            file.sourcePath ?? null,
+            controller.signal,
+            setStatus,
+          );
+          savedPaths.push(outputPath);
         } else {
           const url = URL.createObjectURL(blob);
           const anchor = document.createElement('a');
@@ -278,6 +321,15 @@ export default function App() {
     if (failures.length) {
       setStatus(failures.length === successes.length ? 'CONVERSION FAILED' : 'PARTLY CONVERTED');
       setError(failures.join('\n'));
+    }
+    if (!controller.signal.aborted && savedPaths.length) {
+      try {
+        await invoke('open_converted_file', { path: savedPaths[0] });
+      } catch (cause) {
+        const message = errorMessage(cause, 'Windows could not open the converted file.');
+        setStatus('FILE SAVED · COULD NOT OPEN');
+        setError(previous => previous ? `${previous}\n${message}` : message);
+      }
     }
     if (controller.signal.aborted) setStatus(successes.length ? 'EXPORT CANCELED · SAVED FILES KEPT' : 'EXPORT CANCELED');
     else if (!successes.length && !failures.length) setStatus('READY WHEN YOU ARE');

@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "flux-context-menu"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "windows",
  "windows-core",

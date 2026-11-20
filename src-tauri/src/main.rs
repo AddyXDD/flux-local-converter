@@ -2,17 +2,22 @@
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use std::{
+    collections::HashMap,
     fs::{self, File, OpenOptions},
     io::Write,
     path::Path,
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex,
+    },
 };
 use tauri::{Emitter, Manager, State};
 use tauri_plugin_fs::FsExt;
 
 const MAX_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
-const MAX_OUTPUT_BASE64_BYTES: usize = MAX_OUTPUT_BYTES.div_ceil(3) * 4;
+const MAX_OUTPUT_CHUNK_BYTES: usize = 512 * 1024;
+const MAX_OUTPUT_CHUNK_BASE64_BYTES: usize = MAX_OUTPUT_CHUNK_BYTES.div_ceil(3) * 4;
+const MAX_ACTIVE_OUTPUTS: usize = 2;
 
 #[cfg(windows)]
 use windows::{
@@ -20,12 +25,13 @@ use windows::{
     Win32::{
         Foundation::{HWND, LPARAM, POINT, RECT, WPARAM},
         Graphics::Gdi::{CreateEllipticRgn, DeleteObject, MapWindowPoints, SetWindowRgn, HGDIOBJ},
+        UI::Shell::ShellExecuteW,
         UI::WindowsAndMessaging::{
             EnumWindows, FindWindowExW, FindWindowW, GetClassNameW, GetParent, GetWindowLongPtrW,
             GetWindowRect, SendMessageTimeoutW, SetParent, SetWindowLongPtrW, SetWindowPos,
             GWL_STYLE, SEND_MESSAGE_TIMEOUT_FLAGS, SET_WINDOW_POS_FLAGS, SMTO_ABORTIFHUNG,
-            SMTO_NORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER, WINDOW_LONG_PTR_INDEX,
-            WS_CHILD, WS_POPUP,
+            SMTO_NORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOWNORMAL,
+            WINDOW_LONG_PTR_INDEX, WS_CHILD, WS_POPUP,
         },
     },
 };
@@ -35,6 +41,16 @@ use std::os::windows::ffi::OsStrExt;
 
 static TEMP_ID: AtomicU64 = AtomicU64::new(0);
 static DESKTOP_WIDGET_READY: AtomicBool = AtomicBool::new(false);
+
+type OutputSessions = Arc<Mutex<HashMap<String, OutputSession>>>;
+
+struct OutputSession {
+    path: String,
+    source_path: Option<String>,
+    expected_bytes: usize,
+    next_offset: usize,
+    bytes: Vec<u8>,
+}
 
 #[cfg(windows)]
 fn replace_output_file(temp: &Path, target: &Path) -> Result<(), std::io::Error> {
@@ -62,6 +78,29 @@ fn replace_output_file(temp: &Path, target: &Path) -> Result<(), std::io::Error>
     fs::rename(temp, target)
 }
 
+fn validate_output_path(path: &str, source_path: Option<&str>) -> Result<(), String> {
+    let target = Path::new(path);
+    let parent = target
+        .parent()
+        .ok_or("The output path has no parent folder")?;
+    if !parent.is_dir() {
+        return Err("The selected output folder no longer exists".into());
+    }
+    if let Some(source_path) = source_path {
+        let source = Path::new(source_path);
+        if let (Ok(source), Ok(destination)) = (source.canonicalize(), target.canonicalize()) {
+            if source == destination {
+                return Err(
+                    "The output path points to the original file. Choose a different filename."
+                        .into(),
+                );
+            }
+        }
+    }
+    target.file_name().ok_or("The output filename is invalid")?;
+    Ok(())
+}
+
 fn write_output_atomic_blocking(
     path: String,
     source_path: Option<String>,
@@ -73,25 +112,11 @@ fn write_output_atomic_blocking(
     if bytes.len() > MAX_OUTPUT_BYTES {
         return Err("The converted file is larger than the current safe 32 MB limit".into());
     }
+    validate_output_path(&path, source_path.as_deref())?;
     let target = Path::new(&path);
     let parent = target
         .parent()
         .ok_or("The output path has no parent folder")?;
-    if !parent.is_dir() {
-        return Err("The selected output folder no longer exists".into());
-    }
-    if let Some(source_path) = source_path {
-        let source = Path::new(&source_path);
-        if let (Ok(source), Ok(destination)) = (source.canonicalize(), target.canonicalize()) {
-            if source == destination {
-                return Err(
-                    "The output path points to the original file. Choose a different filename."
-                        .into(),
-                );
-            }
-        }
-    }
-    target.file_name().ok_or("The output filename is invalid")?;
     match target
         .extension()
         .and_then(|value| value.to_str())
@@ -173,32 +198,175 @@ fn write_output_atomic_blocking(
     result
 }
 
-fn decode_output_base64(value: &str) -> Result<Vec<u8>, String> {
-    if value.len() > MAX_OUTPUT_BASE64_BYTES {
-        return Err("The converted file is larger than the current safe 32 MB limit".into());
+fn decode_output_chunk(value: &str) -> Result<Vec<u8>, String> {
+    if value.len() > MAX_OUTPUT_CHUNK_BASE64_BYTES {
+        return Err("An output transfer chunk exceeded the safe size limit".into());
     }
     let bytes = BASE64_STANDARD
         .decode(value)
-        .map_err(|_| "The converted file payload was not valid Base64")?;
-    if bytes.is_empty() {
-        return Err("The converter produced an empty file".into());
-    }
-    if bytes.len() > MAX_OUTPUT_BYTES {
-        return Err("The converted file is larger than the current safe 32 MB limit".into());
+        .map_err(|_| "The output transfer chunk was not valid Base64")?;
+    if bytes.is_empty() || bytes.len() > MAX_OUTPUT_CHUNK_BYTES {
+        return Err("An output transfer chunk had an invalid size".into());
     }
     Ok(bytes)
 }
 
+#[tauri::command(rename_all = "camelCase")]
+fn begin_output_write(
+    path: String,
+    source_path: Option<String>,
+    total_bytes: usize,
+    sessions: State<'_, OutputSessions>,
+) -> Result<String, String> {
+    if total_bytes == 0 {
+        return Err("The converter produced an empty file".into());
+    }
+    if total_bytes > MAX_OUTPUT_BYTES {
+        return Err("The converted file is larger than the current safe 32 MB limit".into());
+    }
+    validate_output_path(&path, source_path.as_deref())?;
+
+    let mut active = sessions
+        .lock()
+        .map_err(|_| "Could not start the output transfer")?;
+    if active.len() >= MAX_ACTIVE_OUTPUTS {
+        return Err("Another output is still being saved. Try again in a moment.".into());
+    }
+    let session_id = format!(
+        "{}-{}",
+        std::process::id(),
+        TEMP_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    active.insert(
+        session_id.clone(),
+        OutputSession {
+            path,
+            source_path,
+            expected_bytes: total_bytes,
+            next_offset: 0,
+            bytes: Vec::new(),
+        },
+    );
+    Ok(session_id)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn append_output_chunk(
+    session_id: String,
+    offset: usize,
+    data_base64: String,
+    sessions: State<'_, OutputSessions>,
+) -> Result<(), String> {
+    let sessions = Arc::clone(&*sessions);
+    tauri::async_runtime::spawn_blocking(move || {
+        let bytes = decode_output_chunk(&data_base64)?;
+        let mut active = sessions
+            .lock()
+            .map_err(|_| "Could not append the output transfer chunk")?;
+        let session = active
+            .get_mut(&session_id)
+            .ok_or("The output transfer expired. Start the conversion again.")?;
+        if offset != session.next_offset {
+            return Err(
+                "The output transfer arrived out of order. Start the conversion again.".into(),
+            );
+        }
+        let end = offset
+            .checked_add(bytes.len())
+            .ok_or("The output transfer exceeded the safe size limit")?;
+        if end > session.expected_bytes {
+            return Err("The output transfer exceeded its expected size".into());
+        }
+        session.bytes.extend_from_slice(&bytes);
+        session.next_offset = end;
+        Ok(())
+    })
+    .await
+    .map_err(|error| format!("Could not finish the output transfer chunk: {error}"))?
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn finish_output_write(
+    session_id: String,
+    sessions: State<'_, OutputSessions>,
+) -> Result<(), String> {
+    let sessions = Arc::clone(&*sessions);
+    tauri::async_runtime::spawn_blocking(move || {
+        let session = sessions
+            .lock()
+            .map_err(|_| "Could not finalize the output transfer")?
+            .remove(&session_id)
+            .ok_or("The output transfer expired. Start the conversion again.")?;
+        if session.next_offset != session.expected_bytes {
+            return Err("The output transfer ended before all file data arrived".into());
+        }
+        write_output_atomic_blocking(session.path, session.source_path, session.bytes)
+    })
+    .await
+    .map_err(|error| format!("Could not finish saving the converted file: {error}"))?
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn abort_output_write(
+    session_id: String,
+    sessions: State<'_, OutputSessions>,
+) -> Result<(), String> {
+    sessions
+        .lock()
+        .map_err(|_| "Could not cancel the output transfer")?
+        .remove(&session_id);
+    Ok(())
+}
+
+#[cfg(windows)]
+#[tauri::command(rename_all = "camelCase")]
+fn open_converted_file(path: String) -> Result<(), String> {
+    let file = Path::new(&path);
+    if !file.is_file() {
+        return Err("The converted file is no longer available to open".into());
+    }
+    let path: Vec<u16> = file.as_os_str().encode_wide().chain(Some(0)).collect();
+    let result = unsafe {
+        ShellExecuteW(
+            None,
+            w!("open"),
+            PCWSTR(path.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    if (result.0 as isize) <= 32 {
+        return Err("Windows could not open the converted file with its default app".into());
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+#[tauri::command(rename_all = "camelCase")]
+fn open_converted_file(_path: String) -> Result<(), String> {
+    Err("Opening converted files is only available on Windows".into())
+}
+
 #[cfg(test)]
 mod output_tests {
-    use super::{decode_output_base64, write_output_atomic_blocking};
-    use crate::{
-        __cmd__write_output_atomic, __tauri_command_name_write_output_atomic, write_output_atomic,
+    use super::{
+        decode_output_chunk, write_output_atomic_blocking, OutputSessions, BASE64_STANDARD,
+        MAX_OUTPUT_CHUNK_BYTES,
     };
+    use crate::{
+        abort_output_write, append_output_chunk, begin_output_write, finish_output_write,
+        open_converted_file,
+    };
+    use base64::Engine as _;
     use std::{
+        collections::HashMap,
         fs,
         path::PathBuf,
-        sync::atomic::{AtomicU64, Ordering},
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc, Mutex,
+        },
     };
 
     static TEST_ID: AtomicU64 = AtomicU64::new(0);
@@ -245,50 +413,88 @@ mod output_tests {
     }
 
     #[test]
-    fn decodes_base64_export_and_writes_the_original_bytes() {
+    fn rejects_invalid_base64_output() {
+        assert!(decode_output_chunk("not base64!").is_err());
+    }
+
+    #[test]
+    fn open_converted_file_rejects_missing_output() {
         let dir = test_dir();
-        let output = dir.join("result.txt");
-        let bytes = decode_output_base64("Y29udmVydGVk").expect("decode export bytes");
-        write_output_atomic_blocking(output.to_string_lossy().into_owned(), None, bytes)
-            .expect("write decoded export");
-        assert_eq!(fs::read(&output).expect("read result"), b"converted");
+        let missing = dir.join("missing.txt");
+        assert!(open_converted_file(missing.to_string_lossy().into_owned()).is_err());
         let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn rejects_invalid_base64_output() {
-        assert!(decode_output_base64("not base64!").is_err());
-    }
-
-    #[test]
-    fn writes_export_through_tauri_json_ipc() {
+    fn writes_chunked_export_through_tauri_json_ipc() {
         let dir = test_dir();
         let output = dir.join("ipc-result.txt");
+        let payload = vec![b'A'; MAX_OUTPUT_CHUNK_BYTES + 37];
         let app = tauri::test::mock_builder()
-            .invoke_handler(tauri::generate_handler![write_output_atomic])
+            .manage(Arc::new(Mutex::new(HashMap::new())) as OutputSessions)
+            .invoke_handler(tauri::generate_handler![
+                begin_output_write,
+                append_output_chunk,
+                finish_output_write,
+                abort_output_write,
+                open_converted_file
+            ])
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .expect("build mock Tauri app");
         let window = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
             .build()
             .expect("build mock webview window");
-        let request = tauri::webview::InvokeRequest {
-            cmd: "write_output_atomic".into(),
+
+        let begin = tauri::test::get_ipc_response(
+            &window,
+            ipc_request(
+                "begin_output_write",
+                serde_json::json!({
+                    "path": output.to_string_lossy(),
+                    "sourcePath": null,
+                    "totalBytes": payload.len()
+                }),
+            ),
+        )
+        .expect("begin JSON IPC output")
+        .deserialize::<String>()
+        .expect("decode output session id");
+        for (index, chunk) in payload.chunks(MAX_OUTPUT_CHUNK_BYTES).enumerate() {
+            let response = tauri::test::get_ipc_response(
+                &window,
+                ipc_request(
+                    "append_output_chunk",
+                    serde_json::json!({
+                        "sessionId": begin.clone(),
+                        "offset": index * MAX_OUTPUT_CHUNK_BYTES,
+                        "dataBase64": BASE64_STANDARD.encode(chunk)
+                    }),
+                ),
+            );
+            assert!(response.is_ok(), "JSON IPC chunk failed: {response:?}");
+        }
+        let response = tauri::test::get_ipc_response(
+            &window,
+            ipc_request(
+                "finish_output_write",
+                serde_json::json!({ "sessionId": begin.clone() }),
+            ),
+        );
+        assert!(response.is_ok(), "JSON IPC finish failed: {response:?}");
+        assert_eq!(fs::read(&output).expect("read IPC export"), payload);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    fn ipc_request(cmd: &str, body: serde_json::Value) -> tauri::webview::InvokeRequest {
+        tauri::webview::InvokeRequest {
+            cmd: cmd.into(),
             callback: tauri::ipc::CallbackFn(0),
             error: tauri::ipc::CallbackFn(1),
             url: "http://tauri.localhost".parse().expect("parse Tauri URL"),
-            body: tauri::ipc::InvokeBody::Json(serde_json::json!({
-                "path": output.to_string_lossy(),
-                "sourcePath": null,
-                "dataBase64": "Y29udmVydGVk"
-            })),
+            body: tauri::ipc::InvokeBody::Json(body),
             headers: Default::default(),
             invoke_key: tauri::test::INVOKE_KEY.to_string(),
-        };
-
-        let response = tauri::test::get_ipc_response(&window, request);
-        assert!(response.is_ok(), "JSON IPC export failed: {response:?}");
-        assert_eq!(fs::read(&output).expect("read IPC export"), b"converted");
-        let _ = fs::remove_dir_all(dir);
+        }
     }
 }
 
@@ -311,19 +517,6 @@ fn write_startup_log(message: &str) {
 }
 
 #[tauri::command(rename_all = "camelCase")]
-async fn write_output_atomic(
-    path: String,
-    source_path: Option<String>,
-    data_base64: String,
-) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let bytes = decode_output_base64(&data_base64)?;
-        write_output_atomic_blocking(path, source_path, bytes)
-    })
-    .await
-    .map_err(|error| format!("Could not finish saving the converted file: {error}"))?
-}
-
 fn context_files(args: &[String]) -> Vec<String> {
     let Some(index) = args.iter().position(|arg| arg == "--convert") else {
         return Vec::new();
@@ -477,6 +670,7 @@ fn main() {
     let initial_files = context_files(&std::env::args().collect::<Vec<_>>());
     tauri::Builder::default()
         .manage(Mutex::new(initial_files))
+        .manage(Arc::new(Mutex::new(HashMap::new())) as OutputSessions)
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             let files = context_files(&args);
             if !files.is_empty() {
@@ -561,7 +755,11 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            write_output_atomic,
+            begin_output_write,
+            append_output_chunk,
+            finish_output_write,
+            abort_output_write,
+            open_converted_file,
             take_pending_files
         ])
         .run(tauri::generate_context!())

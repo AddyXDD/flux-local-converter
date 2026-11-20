@@ -21,7 +21,8 @@ const PACKAGE_REL_NS = 'http://schemas.openxmlformats.org/package/2006/relations
 const MAX_PACKAGE_EXPANDED = 128 * 1024 * 1024;
 const MAX_XML_PART = 16 * 1024 * 1024;
 const MAX_OCR_PAGES = 50;
-const MAX_PAGE_PIXELS = 16_000_000;
+const MAX_PAGE_PIXELS = 12_000_000;
+const MAX_PAGE_RENDER_SCALE = 2.25;
 const MAX_RASTER_BYTES = 22 * 1024 * 1024;
 
 type PdfDocument = Awaited<ReturnType<typeof pdfjs.getDocument>['promise']>;
@@ -31,6 +32,10 @@ type Progress = (message: string) => void;
 
 function checkCanceled(signal?: AbortSignal): void {
   if (signal?.aborted) throw new DOMException('Export canceled.', 'AbortError');
+}
+
+function yieldToUi(): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, 0));
 }
 
 function xmlDocument(xml: string, description: string): XMLDocument {
@@ -219,7 +224,7 @@ function pdfLineGroups(items: Array<{ str: string; transform: number[]; width: n
 
 async function renderPdfPage(page: PdfPage): Promise<{ canvas: HTMLCanvasElement; width: number; height: number }> {
   const base = page.getViewport({ scale: 1 });
-  const scale = Math.min(2.5, Math.sqrt(MAX_PAGE_PIXELS / (base.width * base.height)));
+  const scale = Math.min(MAX_PAGE_RENDER_SCALE, Math.sqrt(MAX_PAGE_PIXELS / (base.width * base.height)));
   const viewport = page.getViewport({ scale });
   const canvas = document.createElement('canvas');
   canvas.width = Math.ceil(viewport.width);
@@ -239,10 +244,21 @@ async function canvasPng(canvas: HTMLCanvasElement): Promise<Uint8Array> {
   return new Uint8Array(await blob.arrayBuffer());
 }
 
+function bytesToBlob(bytes: Uint8Array, type: string): Blob {
+  const buffer = bytes.buffer;
+  const output = buffer instanceof ArrayBuffer
+    && bytes.byteOffset === 0
+    && bytes.byteLength === buffer.byteLength
+    ? buffer
+    : bytes.slice().buffer as ArrayBuffer;
+  return new Blob([output], { type });
+}
+
 async function ocrPdfPage(page: PdfPage): Promise<RasterPage> {
   const rendered = await renderPdfPage(page);
   try {
-    const [image, ocr] = await Promise.all([canvasPng(rendered.canvas), recognizeCanvas(rendered.canvas)]);
+    const image = await canvasPng(rendered.canvas);
+    const ocr = await recognizeCanvas(rendered.canvas);
     return { image, width: rendered.width, height: rendered.height, pixelWidth: rendered.canvas.width, pixelHeight: rendered.canvas.height, ocr };
   } finally {
     rendered.canvas.width = 0;
@@ -287,6 +303,7 @@ async function readPdf(file: File, onProgress?: Progress, signal?: AbortSignal):
       }
       if (lines.length) sections.push({ title: `Page ${pageNo}`, blocks: lines.map(text => ({ text })) });
       page.cleanup();
+      if (pageNo % 4 === 0) await yieldToUi();
     }
     if (!sections.length) throw new Error('No readable text was found in this PDF, even after offline OCR.');
     return { title: 'PDF', sections };
@@ -351,7 +368,7 @@ async function captureWordPage(page: HTMLElement, useOcr: boolean, signal?: Abor
   checkCanceled(signal);
   const rect = page.getBoundingClientRect();
   if (rect.width <= 0 || rect.height <= 0) throw new Error('A Word page has no printable size.');
-  const scale = Math.min(2.5, Math.sqrt(MAX_PAGE_PIXELS / (rect.width * rect.height)));
+  const scale = Math.min(MAX_PAGE_RENDER_SCALE, Math.sqrt(MAX_PAGE_PIXELS / (rect.width * rect.height)));
   const canvas = await html2canvas(page, {
     scale,
     backgroundColor: '#ffffff',
@@ -361,10 +378,8 @@ async function captureWordPage(page: HTMLElement, useOcr: boolean, signal?: Abor
     imageTimeout: 5000,
   });
   try {
-    const [image, ocr] = await Promise.all([
-      canvasPng(canvas),
-      useOcr ? recognizeCanvas(canvas) : Promise.resolve({ text: '', words: [] }),
-    ]);
+    const image = await canvasPng(canvas);
+    const ocr = useOcr ? await recognizeCanvas(canvas) : { text: '', words: [] };
     checkCanceled(signal);
     page.setAttribute('aria-label', ocr.text ? `OCR text: ${ocr.text.slice(0, 20000)}` : 'Rendered Word page');
     return {
@@ -395,6 +410,7 @@ async function captureWordPages(file: File, onProgress?: Progress, signal?: Abor
         throw new Error('This page-image export would exceed the safe 22 MB image budget. Try fewer pages or a smaller document.');
       }
       pages.push(page);
+      await yieldToUi();
     }
     return { pages, rendered };
   } catch (error) {
@@ -445,11 +461,10 @@ async function asRasterPdf(pages: RasterPage[], signal?: AbortSignal): Promise<B
     const page = pdf.addPage([raster.width, raster.height]);
     const image = await pdf.embedPng(raster.image);
     page.drawImage(image, { x: 0, y: 0, width: raster.width, height: raster.height });
+    await yieldToUi();
   }
   const bytes = await pdf.save();
-  const output = new ArrayBuffer(bytes.byteLength);
-  new Uint8Array(output).set(bytes);
-  return new Blob([output], { type: 'application/pdf' });
+  return bytesToBlob(bytes, 'application/pdf');
 }
 
 function base64(bytes: Uint8Array): string {
@@ -489,10 +504,16 @@ async function pdfPagesAsImages(file: File, onProgress?: Progress, signal?: Abor
     for (let pageNo = 1; pageNo <= opened.pdf.numPages; pageNo++) {
       checkCanceled(signal);
       onProgress?.(`OCR PDF PAGE ${pageNo} / ${opened.pdf.numPages} · RUNNING ON THIS DEVICE`);
-      const page = await ocrPdfPage(await opened.pdf.getPage(pageNo));
-      imageBytes += page.image.byteLength;
-      if (imageBytes > MAX_RASTER_BYTES) throw new Error('This page-image export would exceed the safe 22 MB image budget. Try fewer pages or a smaller document.');
-      pages.push(page);
+      const pdfPage = await opened.pdf.getPage(pageNo);
+      try {
+        const page = await ocrPdfPage(pdfPage);
+        imageBytes += page.image.byteLength;
+        if (imageBytes > MAX_RASTER_BYTES) throw new Error('This page-image export would exceed the safe 22 MB image budget. Try fewer pages or a smaller document.');
+        pages.push(page);
+      } finally {
+        pdfPage.cleanup();
+      }
+      await yieldToUi();
     }
     return pages;
   } finally {
@@ -564,9 +585,7 @@ async function asPdf(extracted: ExtractedDocument): Promise<Blob> {
       y -= 8;
     }
     const bytes = await pdf.save();
-    const output = new ArrayBuffer(bytes.byteLength);
-    new Uint8Array(output).set(bytes);
-    return new Blob([output], { type: 'application/pdf' });
+    return bytesToBlob(bytes, 'application/pdf');
   } catch (error) {
     if (error instanceof Error && /WinAnsi|encode/i.test(error.message)) throw new Error('This PDF export font cannot encode one or more characters in the document. Use DOCX or TXT to preserve its full text.');
     throw error;

@@ -1,12 +1,6 @@
 import Tesseract from 'tesseract.js';
 
-export type OcrWord = {
-  text: string;
-  confidence: number;
-  bbox: { x0: number; y0: number; x1: number; y1: number };
-};
-
-export type OcrPage = { text: string; words: OcrWord[] };
+export type OcrPage = { text: string };
 
 type OcrWorker = Awaited<ReturnType<typeof Tesseract.createWorker>>;
 let workerPromise: Promise<OcrWorker> | undefined;
@@ -44,7 +38,7 @@ export async function recognizeCanvas(canvas: HTMLCanvasElement): Promise<OcrPag
   try {
     result = await worker.recognize(canvas, { rotateAuto: true }, {
       text: true,
-      blocks: true,
+      blocks: false,
       layoutBlocks: false,
       hocr: false,
       tsv: false,
@@ -60,14 +54,7 @@ export async function recognizeCanvas(canvas: HTMLCanvasElement): Promise<OcrPag
   } catch (error) {
     throw new Error(`Offline English OCR failed: ${error instanceof Error ? error.message : 'recognition failed'}`);
   }
-  const text = result.data.text.trim();
-  const words = (result.data.blocks ?? []).flatMap(block => block.paragraphs.flatMap(paragraph => paragraph.lines.flatMap(line => line.words)))
-    .filter(word => word.text.trim() && word.confidence >= 20).map(word => ({
-    text: word.text.trim(),
-    confidence: word.confidence,
-    bbox: word.bbox,
-  }));
-  return { text, words };
+  return { text: result.data.text.trim() };
 }
 
 export async function stopOcrWorker(): Promise<void> {

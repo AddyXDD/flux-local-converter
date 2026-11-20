@@ -68,7 +68,7 @@ try {
   Add-AppxPackage -Path $packagePath -ExternalLocation $InstallRoot -ErrorAction Stop
   $registered = Get-AppxPackage -Name 'FluxLocalConverterShell' | Sort-Object Version -Descending | Select-Object -First 1
   if (-not $registered) { throw 'Windows did not register the FLUX sparse package.' }
-  if ($registered.Version.ToString() -ne '0.1.5.0') { throw "Unexpected sparse package version: $($registered.Version)" }
+  if ($registered.Version.ToString() -ne '0.1.6.0') { throw "Unexpected sparse package version: $($registered.Version)" }
 
   [xml] $manifest = Get-AppxPackageManifest -Package $registered.PackageFullName
   $namespaces = [System.Xml.XmlNamespaceManager]::new($manifest.NameTable)
