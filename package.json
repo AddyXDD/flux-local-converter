@@ -1,7 +1,7 @@
 {
   "name": "flux-local-converter",
   "private": true,
-  "version": "0.1.6",
+  "version": "0.1.7",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -10,7 +10,8 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "desktop": "tauri dev",
-    "desktop:build": "tauri build --no-bundle && tauri bundle --bundles nsis --ci --no-binary-patching && powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/sign-installer.ps1",
+    "desktop:build": "powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/build-desktop.ps1 -Variant online",
+    "desktop:build:offline": "powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/build-desktop.ps1 -Variant offline",
     "build:context-menu": "powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/build-context-menu.ps1"
   },
   "dependencies": {

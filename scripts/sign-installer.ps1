@@ -1,3 +1,9 @@
+[CmdletBinding()]
+param(
+  [ValidateSet('online', 'offline')]
+  [string] $Variant = 'online'
+)
+
 $ErrorActionPreference = 'Stop'
 $env:WINAPP_CLI_TELEMETRY_OPTOUT = '1'
 
@@ -8,9 +14,13 @@ $installer = Join-Path $root "src-tauri\target\release\bundle\nsis\FLUX_${versio
 $shellExtension = Join-Path $root 'src-tauri\flux-context-menu\target\release\flux_context_menu.dll'
 $sparsePackage = Join-Path $root 'src-tauri\flux-context-menu\sparse\FluxLocalConverterShell.msix'
 $outputDirectory = Join-Path $root 'outputs'
-$offlineInstaller = Join-Path $outputDirectory 'FLUX-Setup-Offline.exe'
-$versionedInstaller = Join-Path $outputDirectory "FLUX_${version}_x64-setup.exe"
-$hashFile = Join-Path $outputDirectory 'FLUX-Setup-Offline.sha256'
+$artifactStem = if ($Variant -eq 'offline') { "FLUX_${version}_x64-offline-setup" } else { "FLUX_${version}_x64-setup" }
+$aliasName = if ($Variant -eq 'offline') { 'FLUX-Setup-Offline.exe' } else { 'FLUX-Setup.exe' }
+$versionedName = "$artifactStem.exe"
+$aliasInstaller = Join-Path $outputDirectory $aliasName
+$versionedInstaller = Join-Path $outputDirectory $versionedName
+$hashFile = Join-Path $outputDirectory "$versionedName.sha256"
+$aliasHashFile = Join-Path $outputDirectory ($aliasName + '.sha256')
 $pfx = if ([string]::IsNullOrWhiteSpace($env:FLUX_SHELL_SIGNING_PFX_PATH)) {
   Join-Path $env:LOCALAPPDATA 'FLUX-Shell-Extension-Signing\FluxLocalConverterShell.pfx'
 } else {
@@ -62,10 +72,10 @@ if ($signWithStore) {
   if ($LASTEXITCODE -ne 0) { throw "Could not sign the FLUX installer (WinApp CLI exit $LASTEXITCODE)." }
 }
 Assert-FluxSignature $installer
-Copy-Item -LiteralPath $installer -Destination $offlineInstaller -Force
+Copy-Item -LiteralPath $installer -Destination $aliasInstaller -Force
 Copy-Item -LiteralPath $installer -Destination $versionedInstaller -Force
 $sha256 = [System.Security.Cryptography.SHA256]::Create()
-$stream = [System.IO.File]::OpenRead($offlineInstaller)
+$stream = [System.IO.File]::OpenRead($versionedInstaller)
 try {
   $hash = [System.BitConverter]::ToString($sha256.ComputeHash($stream)).Replace('-', '')
 }
@@ -73,5 +83,6 @@ finally {
   $stream.Dispose()
   $sha256.Dispose()
 }
-Set-Content -LiteralPath $hashFile -Value "$hash  FLUX-Setup-Offline.exe" -Encoding ASCII
-Write-Output "Signed installer and wrote SHA-256 $hash to $offlineInstaller"
+Set-Content -LiteralPath $hashFile -Value "$hash  $versionedName" -Encoding ASCII
+Set-Content -LiteralPath $aliasHashFile -Value "$hash  $aliasName" -Encoding ASCII
+Write-Output "Signed $Variant installer and wrote SHA-256 $hash to $versionedInstaller"

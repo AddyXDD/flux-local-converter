@@ -2,7 +2,7 @@
 
 use std::{
     ffi::c_void, ffi::OsString, iter::once, os::windows::ffi::OsStringExt, path::PathBuf,
-    process::Command,
+    process::Command, sync::Mutex,
 };
 
 use windows::{
@@ -23,14 +23,18 @@ use windows::{
             },
         },
         UI::Shell::{
-            IEnumExplorerCommand, IExplorerCommand, IExplorerCommand_Impl, IShellItemArray,
-            SHStrDupW, ECF_DEFAULT, ECS_ENABLED, ECS_HIDDEN, SIGDN_FILESYSPATH,
+            IEnumExplorerCommand, IEnumExplorerCommand_Impl, IExplorerCommand,
+            IExplorerCommand_Impl, IShellItemArray, SHStrDupW, ECF_HASSUBCOMMANDS, ECS_ENABLED,
+            ECS_HIDDEN, SIGDN_FILESYSPATH,
         },
     },
 };
 
 const CLASS_ID: GUID = GUID::from_u128(0x6e94a2d5_68d6_4c0a_9e5d_07f5b9f0a241);
 const COMMAND_ID: GUID = GUID::from_u128(0xd6cce953_4e8d_48ae_8b0c_47c251f9912a);
+const TARGETS: &[&str] = &[
+    "png", "jpg", "webp", "bmp", "pdf", "docx", "txt", "html", "csv", "json", "yaml", "xml", "md",
+];
 const ERROR_CLASS_NOT_AVAILABLE: HRESULT = CLASS_E_CLASSNOTAVAILABLE;
 const ERROR_NO_AGGREGATION: HRESULT = CLASS_E_NOAGGREGATION;
 const ERROR_INVALID_ARGUMENT: HRESULT = E_INVALIDARG;
@@ -41,6 +45,17 @@ struct FluxContextCommand;
 
 #[implement(IClassFactory)]
 struct FluxCommandFactory;
+
+#[implement(IExplorerCommand)]
+struct FluxFormatCommand {
+    target: &'static str,
+}
+
+#[implement(IEnumExplorerCommand)]
+struct FluxCommandEnumerator {
+    targets: Vec<&'static str>,
+    position: Mutex<usize>,
+}
 
 impl IExplorerCommand_Impl for FluxContextCommand_Impl {
     fn GetTitle(&self, _items: Ref<IShellItemArray>) -> Result<PWSTR> {
@@ -71,7 +86,73 @@ impl IExplorerCommand_Impl for FluxContextCommand_Impl {
             Ok(paths) if !paths.is_empty() => paths,
             _ => return Ok(ECS_HIDDEN.0 as u32),
         };
-        if paths.iter().all(|path| is_supported(path)) {
+        if !common_targets(&paths).is_empty() {
+            Ok(ECS_ENABLED.0 as u32)
+        } else {
+            Ok(ECS_HIDDEN.0 as u32)
+        }
+    }
+
+    fn Invoke(
+        &self,
+        _items: Ref<IShellItemArray>,
+        _bind_context: Ref<windows::Win32::System::Com::IBindCtx>,
+    ) -> Result<()> {
+        Err(Error::from(E_NOTIMPL))
+    }
+
+    fn GetFlags(&self) -> Result<u32> {
+        Ok(ECF_HASSUBCOMMANDS.0 as u32)
+    }
+
+    fn EnumSubCommands(&self) -> Result<IEnumExplorerCommand> {
+        let enumerator = ComObject::new(FluxCommandEnumerator {
+            targets: TARGETS.to_vec(),
+            position: Mutex::new(0),
+        })
+        .into_interface::<IEnumExplorerCommand>();
+        Ok(enumerator)
+    }
+}
+
+impl IExplorerCommand_Impl for FluxFormatCommand_Impl {
+    fn GetTitle(&self, _items: Ref<IShellItemArray>) -> Result<PWSTR> {
+        duplicate_shell_string(&format!("Convert to {}", self.target.to_ascii_uppercase()))
+    }
+
+    fn GetIcon(&self, _items: Ref<IShellItemArray>) -> Result<PWSTR> {
+        let mut icon = installed_executable()?.to_string_lossy().into_owned();
+        icon.push_str(",0");
+        duplicate_shell_string(&icon)
+    }
+
+    fn GetToolTip(&self, _items: Ref<IShellItemArray>) -> Result<PWSTR> {
+        Err(Error::from(E_NOTIMPL))
+    }
+
+    fn GetCanonicalName(&self) -> Result<GUID> {
+        let index = TARGETS
+            .iter()
+            .position(|target| *target == self.target)
+            .unwrap_or(0) as u128;
+        Ok(GUID::from_u128(
+            0x4ebf97bb_8864_4af2_ba47_c5a07a010000 + index,
+        ))
+    }
+
+    fn GetState(
+        &self,
+        items: Ref<IShellItemArray>,
+        _ok_to_be_slow: windows::core::BOOL,
+    ) -> Result<u32> {
+        let paths = match selected_paths(items) {
+            Ok(paths) if !paths.is_empty() => paths,
+            _ => return Ok(ECS_HIDDEN.0 as u32),
+        };
+        if paths
+            .iter()
+            .all(|path| target_formats(path).contains(&self.target))
+        {
             Ok(ECS_ENABLED.0 as u32)
         } else {
             Ok(ECS_HIDDEN.0 as u32)
@@ -84,10 +165,16 @@ impl IExplorerCommand_Impl for FluxContextCommand_Impl {
         _bind_context: Ref<windows::Win32::System::Com::IBindCtx>,
     ) -> Result<()> {
         let paths = selected_paths(items)?;
-        if paths.is_empty() || paths.iter().any(|path| !is_supported(path)) {
+        if paths.is_empty()
+            || paths
+                .iter()
+                .any(|path| !target_formats(path).contains(&self.target))
+        {
             return Err(Error::from(ERROR_INVALID_ARGUMENT));
         }
         Command::new(installed_executable()?)
+            .arg("--convert-to")
+            .arg(self.target)
             .arg("--convert")
             .args(paths)
             .spawn()
@@ -96,12 +183,79 @@ impl IExplorerCommand_Impl for FluxContextCommand_Impl {
     }
 
     fn GetFlags(&self) -> Result<u32> {
-        Ok(ECF_DEFAULT.0 as u32)
+        Ok(0)
     }
 
     fn EnumSubCommands(&self) -> Result<IEnumExplorerCommand> {
         Err(Error::from(E_NOTIMPL))
     }
+}
+
+impl IEnumExplorerCommand_Impl for FluxCommandEnumerator_Impl {
+    fn Next(
+        &self,
+        count: u32,
+        output: *mut Option<IExplorerCommand>,
+        fetched: *mut u32,
+    ) -> windows::core::HRESULT {
+        if (count > 0 && output.is_null()) || (fetched.is_null() && count != 1) {
+            return E_INVALIDARG;
+        }
+        let mut position = match self.position.lock() {
+            Ok(position) => position,
+            Err(_) => return ERROR_FAIL,
+        };
+        let mut written = 0;
+        while written < count {
+            let Some(target) = self.targets.get(*position).copied() else {
+                break;
+            };
+            let command =
+                ComObject::new(FluxFormatCommand { target }).into_interface::<IExplorerCommand>();
+            unsafe { output.add(written as usize).write(Some(command)) };
+            *position += 1;
+            written += 1;
+        }
+        if !fetched.is_null() {
+            unsafe { *fetched = written };
+        }
+        if written == count {
+            windows::core::HRESULT(0)
+        } else {
+            windows::core::HRESULT(1)
+        }
+    }
+
+    fn Skip(&self, count: u32) -> Result<()> {
+        let mut position = self.position.lock().map_err(|_| Error::from(ERROR_FAIL))?;
+        let requested = position.saturating_add(count as usize);
+        if requested <= self.targets.len() {
+            *position = requested;
+            Ok(())
+        } else {
+            *position = self.targets.len();
+            Err(Error::from(windows::core::HRESULT(1)))
+        }
+    }
+
+    fn Reset(&self) -> Result<()> {
+        *self.position.lock().map_err(|_| Error::from(ERROR_FAIL))? = 0;
+        Ok(())
+    }
+
+    fn Clone(&self) -> Result<IEnumExplorerCommand> {
+        let position = *self.position.lock().map_err(|_| Error::from(ERROR_FAIL))?;
+        Ok(ComObject::new(FluxCommandEnumerator {
+            targets: self.targets.clone(),
+            position: Mutex::new(position),
+        })
+        .into_interface::<IEnumExplorerCommand>())
+    }
+}
+
+fn duplicate_shell_string(value: &str) -> Result<PWSTR> {
+    let wide = value.encode_utf16().chain(once(0)).collect::<Vec<_>>();
+    unsafe { SHStrDupW(PCWSTR::from_raw(wide.as_ptr())) }
 }
 
 impl IClassFactory_Impl for FluxCommandFactory_Impl {
@@ -183,30 +337,52 @@ fn selected_paths(items: Ref<IShellItemArray>) -> Result<Vec<String>> {
     Ok(paths)
 }
 
-fn is_supported(path: &str) -> bool {
-    PathBuf::from(path)
+fn target_formats(path: &str) -> Vec<&'static str> {
+    let extension = PathBuf::from(path)
         .extension()
         .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| {
-            matches!(
-                extension.to_ascii_lowercase().as_str(),
-                "png"
-                    | "jpg"
-                    | "jpeg"
-                    | "webp"
-                    | "bmp"
-                    | "json"
-                    | "csv"
-                    | "xml"
-                    | "txt"
-                    | "md"
-                    | "yaml"
-                    | "yml"
-                    | "pdf"
-                    | "docx"
-                    | "pptx"
-            )
+        .map(str::to_ascii_lowercase);
+    let Some(extension) = extension.as_deref() else {
+        return Vec::new();
+    };
+
+    let candidates: &[&str] = match extension {
+        "png" | "jpg" | "jpeg" | "webp" | "bmp" | "gif" | "tif" | "tiff" | "avif" | "heic" => {
+            &["png", "jpg", "webp", "bmp"]
+        }
+        "pdf" => &["docx", "txt", "html"],
+        "pptx" => &["docx", "pdf", "txt", "html"],
+        "docx" => &["pdf", "txt", "html"],
+        "json" | "csv" | "xml" | "yaml" | "yml" => &["json", "yaml", "csv", "xml", "txt", "md"],
+        "txt" | "md" => &["txt", "md", "html"],
+        _ => return Vec::new(),
+    };
+
+    candidates
+        .iter()
+        .copied()
+        .filter(|target| match extension {
+            "jpeg" | "jpg" => *target != "jpg",
+            "yml" | "yaml" => *target != "yaml",
+            _ => *target != extension,
         })
+        .collect()
+}
+
+fn common_targets(paths: &[String]) -> Vec<&'static str> {
+    let Some(first) = paths.first() else {
+        return Vec::new();
+    };
+    let first_targets = target_formats(first);
+    first_targets
+        .into_iter()
+        .filter(|target| {
+            paths
+                .iter()
+                .skip(1)
+                .all(|path| target_formats(path).contains(target))
+        })
+        .collect()
 }
 
 fn installed_executable() -> Result<PathBuf> {
@@ -245,29 +421,36 @@ fn installed_executable() -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::is_supported;
+    use super::{common_targets, target_formats, FluxCommandEnumerator, TARGETS};
+    use std::sync::Mutex;
+    use windows::{core::ComObject, Win32::UI::Shell::IEnumExplorerCommand};
 
     #[test]
-    fn shows_the_menu_for_every_supported_input_extension() {
-        for path in [
-            "photo.png",
-            "photo.jpg",
-            "photo.jpeg",
-            "photo.webp",
-            "photo.bmp",
-            "data.json",
-            "data.csv",
-            "data.xml",
-            "notes.txt",
-            "notes.md",
-            "config.yaml",
-            "config.yml",
-            "scan.pdf",
-            "slides.docx",
-            "slides.pptx",
-        ] {
-            assert!(is_supported(path), "expected {path} to be supported");
+    fn offers_only_formats_supported_for_each_input_type() {
+        let expected = [
+            ("photo.png", &["jpg", "webp", "bmp"][..]),
+            ("photo.jpeg", &["png", "webp", "bmp"][..]),
+            ("photo.gif", &["png", "jpg", "webp", "bmp"][..]),
+            ("scan.pdf", &["docx", "txt", "html"][..]),
+            ("slides.pptx", &["docx", "pdf", "txt", "html"][..]),
+            ("report.docx", &["pdf", "txt", "html"][..]),
+            ("table.csv", &["json", "yaml", "xml", "txt", "md"][..]),
+            ("config.yml", &["json", "csv", "xml", "txt", "md"][..]),
+            ("notes.txt", &["md", "html"][..]),
+        ];
+        for (path, formats) in expected {
+            assert_eq!(target_formats(path), formats, "formats for {path}");
         }
+        assert_eq!(TARGETS.len(), 13);
+    }
+
+    #[test]
+    fn filters_mixed_selection_to_common_output_formats() {
+        assert_eq!(
+            common_targets(&["slides.pptx".into(), "report.docx".into()]),
+            vec!["pdf", "txt", "html"]
+        );
+        assert!(common_targets(&["photo.png".into(), "scan.pdf".into()]).is_empty());
     }
 
     #[test]
@@ -279,14 +462,49 @@ mod tests {
             "README",
             "folder.name\\README",
         ] {
-            assert!(!is_supported(path), "expected {path} to be hidden");
+            assert!(
+                target_formats(path).is_empty(),
+                "expected {path} to be hidden"
+            );
         }
     }
 
     #[test]
     fn matches_extensions_case_insensitively_and_uses_the_final_suffix() {
-        assert!(is_supported("C:\\files\\REPORT.PDF"));
-        assert!(!is_supported("C:\\files\\report.pdf.exe"));
-        assert!(!is_supported("C:\\files.with.dots\\README"));
+        assert_eq!(
+            target_formats("C:\\files\\REPORT.PDF"),
+            vec!["docx", "txt", "html"]
+        );
+        assert!(target_formats("C:\\files\\report.pdf.exe").is_empty());
+        assert!(target_formats("C:\\files.with.dots\\README").is_empty());
+    }
+
+    #[test]
+    fn enumerates_the_conversion_submenu_without_missing_or_duplicate_commands() {
+        let commands = ComObject::new(FluxCommandEnumerator {
+            targets: TARGETS.to_vec(),
+            position: Mutex::new(0),
+        })
+        .into_interface::<IEnumExplorerCommand>();
+        let mut output: [Option<windows::Win32::UI::Shell::IExplorerCommand>; 13] =
+            std::array::from_fn(|_| None);
+        let mut fetched = 0;
+        let result = unsafe { commands.Next(&mut output, Some(&mut fetched)) };
+        assert_eq!(result.0, 0);
+        assert_eq!(fetched as usize, TARGETS.len());
+        assert!(output.iter().all(Option::is_some));
+
+        let mut one_more = [None];
+        fetched = 1;
+        let result = unsafe { commands.Next(&mut one_more, Some(&mut fetched)) };
+        assert_eq!(result.0, 1);
+        assert_eq!(fetched, 0);
+
+        unsafe { commands.Reset().expect("reset submenu iterator") };
+        let mut first = [None];
+        fetched = 0;
+        let result = unsafe { commands.Next(&mut first, Some(&mut fetched)) };
+        assert_eq!(result.0, 0);
+        assert_eq!(fetched, 1);
     }
 }

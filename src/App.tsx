@@ -50,6 +50,7 @@ async function writeOutputInChunks(
   blob: Blob,
   path: string,
   sourcePath: string | null,
+  allowReplace: boolean,
   signal: AbortSignal,
   onProgress: (message: string) => void,
 ): Promise<void> {
@@ -57,6 +58,7 @@ async function writeOutputInChunks(
     path,
     sourcePath,
     totalBytes: blob.size,
+    allowReplace,
   });
   try {
     let nextProgress = 10;
@@ -86,6 +88,7 @@ export default function App() {
   const [dragging, setDragging] = useState(false);
   const [status, setStatus] = useState('');
   const [error, setError] = useState('');
+  const [requestedConversion, setRequestedConversion] = useState<string | null>(null);
   const [lastFormat, setLastFormat] = useState(() => localStorage.getItem('flux-format') ?? '');
   const input = useRef<HTMLInputElement>(null);
   const cancelController = useRef<AbortController | null>(null);
@@ -158,7 +161,7 @@ export default function App() {
     }
   }, []);
 
-  const addPaths = useCallback(async (paths: string[]) => {
+  const addPaths = useCallback(async (paths: string[], replace = false): Promise<FluxFile[]> => {
     const fresh: FluxFile[] = [];
     const failures: string[] = [];
     for (const path of paths) {
@@ -176,7 +179,7 @@ export default function App() {
       }
     }
     if (fresh.length) {
-      setFiles(previous => [...previous, ...fresh]);
+      setFiles(previous => replace ? fresh : [...previous, ...fresh]);
       setStatus('');
       setError('');
     }
@@ -184,6 +187,7 @@ export default function App() {
       setStatus(failures[0]);
       setError(failures.join('\n'));
     }
+    return fresh;
   }, []);
 
   const browse = useCallback(async () => {
@@ -239,8 +243,17 @@ export default function App() {
     let mounted = true;
     const loadPending = async () => {
       try {
-        const paths = await invoke<string[]>('take_pending_files');
-        if (mounted && paths.length) await addPaths(paths);
+        const request = await invoke<{ paths: string[]; target: string | null }>('take_pending_conversion');
+        const { paths, target } = request;
+        if (mounted && paths.length) {
+          const loaded = await addPaths(paths, !!target);
+          if (target && loaded.length && loaded.every(file => targetsFor(file).includes(target))) {
+            setRequestedConversion(target);
+          } else if (target && loaded.length) {
+            setStatus('FORMAT IS NOT AVAILABLE');
+            setError(`The selected files cannot all be converted to ${target.toUpperCase()}.`);
+          }
+        }
       } catch (cause) {
         if (mounted) {
           setStatus('FILE COULD NOT OPEN');
@@ -262,7 +275,7 @@ export default function App() {
   const displayItem = convertible[0] ?? files[0];
   const fileCount = convertible.length;
 
-  const run = async (target: string) => {
+  const run = async (target: string, autoSave = false) => {
     if (busy || !formats.includes(target)) return;
     setBusy(true);
     setStatus('');
@@ -280,7 +293,12 @@ export default function App() {
         if (isTauri()) {
           const slash = Math.max(file.sourcePath?.lastIndexOf('/') ?? -1, file.sourcePath?.lastIndexOf('\\') ?? -1);
           const sibling = file.sourcePath && slash >= 0 ? `${file.sourcePath.slice(0, slash + 1)}${name}` : name;
-          outputPath = await save({ title: `Save ${name}`, defaultPath: sibling, filters: [{ name: `${target.toUpperCase()} file`, extensions: [target] }] });
+          if (autoSave) {
+            if (!file.sourcePath) throw new Error('The selected file path is unavailable for direct conversion.');
+            outputPath = await invoke<string>('unique_output_path', { sourcePath: file.sourcePath, targetExtension: target });
+          } else {
+            outputPath = await save({ title: `Save ${name}`, defaultPath: sibling, filters: [{ name: `${target.toUpperCase()} file`, extensions: [target] }] });
+          }
           if (!outputPath) continue;
 
         }
@@ -294,6 +312,7 @@ export default function App() {
             blob,
             outputPath,
             file.sourcePath ?? null,
+            !autoSave,
             controller.signal,
             setStatus,
           );
@@ -337,6 +356,18 @@ export default function App() {
     cancelController.current = null;
     setBusy(false);
   };
+
+  useEffect(() => {
+    if (!requestedConversion || busy || !files.length) return;
+    if (!formats.includes(requestedConversion)) {
+      setRequestedConversion(null);
+      setStatus('FORMAT IS NOT AVAILABLE');
+      setError(`The selected files cannot all be converted to ${requestedConversion.toUpperCase()}.`);
+      return;
+    }
+    setRequestedConversion(null);
+    void run(requestedConversion, true);
+  }, [requestedConversion, busy, files, formats]);
 
   const onDrop = (event: DragEvent<HTMLElement>) => {
     event.preventDefault();

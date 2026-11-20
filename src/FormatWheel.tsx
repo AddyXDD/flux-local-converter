@@ -16,8 +16,6 @@ type Props = {
   onBrowse: () => void;
 };
 
-const IDLE_SLICES = Array.from({ length: 8 }, (_, index) => `idle-${index}`);
-const IDLE_FILLS = ['#faf8ff', '#fffefd', '#f5f2ff', '#ffffff', '#f8f6ff', '#fffefd', '#f3f5ff', '#ffffff'];
 const label = (format: string) => format === 'jpg' ? 'JPG' : format.toUpperCase();
 const shorten = (value: string, limit: number) => value.length > limit ? `${value.slice(0, limit - 1)}…` : value;
 
@@ -27,26 +25,60 @@ function point(radius: number, degrees: number) {
 }
 
 function segmentPath(start: number, end: number) {
-  const innerStart = point(77, start);
-  const innerEnd = point(77, end);
+  const innerStart = point(79, start);
+  const innerEnd = point(79, end);
   const outerEnd = point(168, end);
   const outerStart = point(168, start);
   const largeArc = end - start > 180 ? 1 : 0;
-  return `M ${innerStart.x} ${innerStart.y} A 77 77 0 ${largeArc} 1 ${innerEnd.x} ${innerEnd.y} L ${outerEnd.x} ${outerEnd.y} A 168 168 0 ${largeArc} 0 ${outerStart.x} ${outerStart.y} Z`;
+  return `M ${innerStart.x} ${innerStart.y} A 79 79 0 ${largeArc} 1 ${innerEnd.x} ${innerEnd.y} L ${outerEnd.x} ${outerEnd.y} A 168 168 0 ${largeArc} 0 ${outerStart.x} ${outerStart.y} Z`;
+}
+
+function FormatGlyph({ format, x, y }: { format: string; x: number; y: number }): ReactNode {
+  const origin = `translate(${x - 12} ${y - 12})`;
+  if (['png', 'jpg', 'webp', 'bmp'].includes(format)) {
+    return <g transform={origin} className="format-glyph" aria-hidden="true">
+      <rect x="2.5" y="3.5" width="19" height="17" rx="3"/>
+      <circle cx="8.2" cy="8.5" r="1.8"/>
+      <path d="m4.5 17 5.2-5.2 3.4 3.2 3.1-2.8 4.1 4.8"/>
+    </g>;
+  }
+  if (format === 'csv') {
+    return <g transform={origin} className="format-glyph" aria-hidden="true">
+      <rect x="3" y="4" width="18" height="16" rx="2"/>
+      <path d="M9 4v16M15 4v16M3 9h18M3 15h18"/>
+    </g>;
+  }
+  if (['json', 'yaml', 'xml'].includes(format)) {
+    const symbol = format === 'json' ? '{ }' : format === 'xml' ? '</>' : 'Y';
+    return <g transform={origin} className="format-glyph code-glyph" aria-hidden="true">
+      <rect x="2.5" y="3.5" width="19" height="17" rx="4"/>
+      <text x="12" y="16" textAnchor="middle">{symbol}</text>
+    </g>;
+  }
+  const symbol = format === 'docx' ? 'W' : format === 'pptx' ? 'P' : format === 'pdf' ? 'P' : format === 'html' ? '<>' : format.slice(0, 1).toUpperCase();
+  return <g transform={origin} className="format-glyph document-glyph" aria-hidden="true">
+    <path d="M5 2.5h10l5 5V22H5z"/>
+    <path d="M15 2.5v5h5M8.5 12h8M8.5 16h8"/>
+    <text x="12.5" y="20" textAnchor="middle">{symbol}</text>
+  </g>;
+}
+
+function FluxMark({ className = '' }: { className?: string }) {
+  return <path className={`flux-mark ${className}`} d="M180 139 185.4 154.6 201 160 185.4 165.4 180 181 174.6 165.4 159 160 174.6 154.6Z"/>;
 }
 
 export default function FormatWheel({ item, count, formats, busy, status, error, dragging, onConvert, onBrowse }: Props) {
   const active = !!item && formats.length > 0 && !status;
   const standby = !item && !status && !busy;
-  const options = active ? formats : IDLE_SLICES;
-  const arc = 360 / options.length;
-  const gap = Math.min(3, arc * 0.08);
+  const success = !busy && !error && !!status && /\bSAVED\b/i.test(status);
+  const failed = !!error;
+  const options = active ? formats : [];
+  const arc = options.length ? 360 / options.length : 0;
+  const gap = Math.min(3.5, arc * 0.08);
   const startOffset = -90 - arc / 2;
-  const centerName = shorten(item?.file.name ?? '', 16);
-  const centerIsAction = !active && !busy;
+  const centerAction = !active && !busy;
   const pointerStart = useRef<{ x: number; y: number; moving: boolean } | null>(null);
   const suppressClick = useRef(false);
-  const centerAction = () => { if (!busy && (!active || !item)) onBrowse(); };
 
   const onPointerDown = (event: PointerEvent<SVGSVGElement>) => {
     if (event.button !== 0 || busy || !isTauri()) return;
@@ -67,26 +99,25 @@ export default function FormatWheel({ item, count, formats, busy, status, error,
     if (suppressClick.current) window.setTimeout(() => { suppressClick.current = false; }, 300);
   };
 
-  const centerLines = busy
-    ? ['EXPORTING', shorten(status || `${count} FILES`, 18), 'ESC TO CANCEL']
-    : status
-    ? error
-      ? ['CONVERSION ISSUE', shorten(error.split('\n')[0], 18), 'CLICK TO TRY AGAIN']
-      : ['SAVED', shorten(status, 18), 'CLICK TO ADD MORE']
-      : active
-        ? [count === 1 ? item.ext.toUpperCase() : `${count} FILES`, count === 1 ? centerName : `${item.ext.toUpperCase()} BATCH`, 'CHOOSE AN OUTPUT']
-        : item
-          ? ['NO OPTIONS', item.ext.toUpperCase(), 'CLICK TO PICK AGAIN']
-          : ['FLUX', dragging ? 'DROP FILE HERE' : 'DROP A FILE', dragging ? 'RELEASE TO LOAD' : 'CLICK TO BROWSE'];
-
+  const centerActionLabel = standby ? 'FLUX file converter. Drop or choose a file. Drag the donut to move it on the desktop.'
+    : active ? `Convert ${item?.file.name}; choose one of ${formats.join(', ')}.`
+      : error ? `Conversion error: ${error}` : status || 'Browse files';
   const title: ReactNode = error || status ? <title>{error || status}</title> : null;
+  const rootState = [
+    dragging && 'is-dragging',
+    active && 'has-file',
+    standby && 'is-standby',
+    busy && 'is-processing',
+    success && 'is-success',
+    failed && 'is-error',
+  ].filter(Boolean).join(' ');
 
-  return <main className={`donut-app${dragging ? ' is-dragging' : ''}${active ? ' has-file' : ''}${standby ? ' is-standby' : ''}`}>
+  return <main className={`donut-app ${rootState}`}>
     <svg
       className="donut"
       viewBox="0 0 360 360"
       role="group"
-      aria-label={active ? `Convert ${item?.file.name}. Drag the donut to move it on the desktop.` : 'FLUX file converter. Drop or choose a file. Drag the donut to move it on the desktop.'}
+      aria-label={centerActionLabel}
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
       onPointerUp={onPointerEnd}
@@ -100,63 +131,95 @@ export default function FormatWheel({ item, count, formats, busy, status, error,
       }}
     >
       <defs>
-        <radialGradient id="ring-wash" cx="36%" cy="22%" r="78%">
-          <stop offset="0%" stopColor="#ffffff"/>
-          <stop offset="67%" stopColor="#faf9ff"/>
-          <stop offset="100%" stopColor="#efedfa"/>
+        <radialGradient id="wheel-backdrop" cx="38%" cy="23%" r="82%">
+          <stop offset="0%" stopColor="#1c2941" stopOpacity=".97"/>
+          <stop offset="72%" stopColor="#0c1322" stopOpacity=".98"/>
+          <stop offset="100%" stopColor="#070b13" stopOpacity=".99"/>
         </radialGradient>
-        <linearGradient id="center-wash" x1="0" y1="0" x2="1" y2="1">
-          <stop offset="0%" stopColor="#ffffff"/>
-          <stop offset="100%" stopColor="#fbfaff"/>
+        <linearGradient id="segment-glass" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0%" stopColor="#18243a" stopOpacity=".98"/>
+          <stop offset="100%" stopColor="#0a1020" stopOpacity=".98"/>
         </linearGradient>
-        <filter id="donut-shadow" x="-20%" y="-20%" width="140%" height="140%">
-          <feDropShadow dx="0" dy="5" stdDeviation="6" floodColor="#403774" floodOpacity=".17"/>
+        <linearGradient id="segment-highlight" x1="0" y1="0" x2=".8" y2="1">
+          <stop offset="0%" stopColor="#7657e9"/>
+          <stop offset="58%" stopColor="#4439a5"/>
+          <stop offset="100%" stopColor="#1a2750"/>
+        </linearGradient>
+        <radialGradient id="center-glass" cx="32%" cy="20%" r="88%">
+          <stop offset="0%" stopColor="#1a2740"/>
+          <stop offset="100%" stopColor="#070b15"/>
+        </radialGradient>
+        <linearGradient id="flux-sheen" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0%" stopColor="#dff9ff"/>
+          <stop offset="42%" stopColor="#9da6ff"/>
+          <stop offset="100%" stopColor="#c77aff"/>
+        </linearGradient>
+        <filter id="violet-lift" x="-30%" y="-30%" width="160%" height="160%">
+          <feDropShadow dx="0" dy="0" stdDeviation="3" floodColor="#9572ff" floodOpacity=".55"/>
         </filter>
       </defs>
 
-      <circle className="donut-aura" cx="180" cy="180" r="174"/>
-      <circle className="donut-outline" cx="180" cy="180" r="173"/>
-      <g filter="url(#donut-shadow)">
-        {options.map((format, index) => {
-          const center = startOffset + index * arc + arc / 2;
-          const start = startOffset + index * arc + gap / 2;
-          const end = startOffset + (index + 1) * arc - gap / 2;
-          const textPosition = point(123, center);
-          const converts = active && !busy;
-          const activate = () => {
-            if (busy) return;
-            if (converts) onConvert(format);
-            else onBrowse();
-          };
-          return <g className={`donut-slice${active ? ' convertible' : ' hint'}`} key={format} role={active ? 'button' : undefined} tabIndex={active && !busy ? 0 : -1} aria-label={active ? `Convert to ${format.toUpperCase()}` : undefined} aria-disabled={active ? busy : undefined} onClick={active ? activate : undefined} onKeyDown={active ? event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); activate(); } } : undefined}>
-            <path d={segmentPath(start, end)} fill={active ? (index % 2 ? '#fffefd' : '#faf9ff') : IDLE_FILLS[index % IDLE_FILLS.length]} stroke="#dedbe8" strokeWidth="1.1"/>
-            {active && <text x={textPosition.x} y={textPosition.y + 4} textAnchor="middle" className="donut-label">{label(format)}</text>}
-          </g>;
-        })}
-      </g>
+      {active ? <g className="wheel-expanded">
+        <circle className="wheel-backdrop" cx="180" cy="180" r="173"/>
+        <circle className="donut-aura" cx="180" cy="180" r="171"/>
+        <g className="wheel-segments">
+          {options.map((format, index) => {
+            const center = startOffset + index * arc + arc / 2;
+            const start = startOffset + index * arc + gap / 2;
+            const end = startOffset + (index + 1) * arc - gap / 2;
+            const iconPosition = point(122, center);
+            const labelPosition = point(122, center);
+            const activate = () => { if (!busy) onConvert(format); };
+            return <g className="donut-slice convertible" key={format} role="button" tabIndex={busy ? -1 : 0}
+              aria-label={`Convert to ${label(format)}`} aria-disabled={busy}
+              onClick={activate}
+              onKeyDown={event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); activate(); } }}>
+              <path className="slice-surface" d={segmentPath(start, end)} fill="url(#segment-glass)"/>
+              <FormatGlyph format={format} x={iconPosition.x} y={iconPosition.y - 9}/>
+              <text x={labelPosition.x} y={labelPosition.y + 19} textAnchor="middle" className="donut-label">{label(format)}</text>
+            </g>;
+          })}
+        </g>
+        <circle className="donut-outline" cx="180" cy="180" r="173"/>
+        <circle className="wheel-inner-outline" cx="180" cy="180" r="77"/>
+      </g> : <g className="wheel-collapsed">
+        <circle className="standby-halo" cx="180" cy="180" r="105"/>
+        <circle className="standby-ring" cx="180" cy="180" r="96"/>
+        <circle className="standby-ring inner" cx="180" cy="180" r="82"/>
+      </g>}
 
-      <g className={`donut-center${centerIsAction ? ' center-action' : ''}${active ? ' center-active' : ''}${status ? ' center-status' : ''}`} role={centerIsAction ? 'button' : 'group'} tabIndex={centerIsAction ? 0 : -1} aria-label={active ? `${count} files ready, choose a format around the ring` : 'Browse files'} onClick={centerIsAction ? centerAction : undefined} onKeyDown={centerIsAction ? event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); centerAction(); } } : undefined}>
+      <g className={`donut-center${centerAction ? ' center-action' : ''}`} role={centerAction ? 'button' : 'group'} tabIndex={centerAction ? 0 : -1}
+        aria-label={centerActionLabel} onClick={centerAction ? onBrowse : undefined}
+        onKeyDown={centerAction ? event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onBrowse(); } } : undefined}>
         {title}
         <circle cx="180" cy="180" r="72" className="donut-center-disc"/>
+        {dragging && <circle cx="180" cy="180" r="101" className="drag-ring" aria-hidden="true"/>}
+        {busy && <circle cx="180" cy="180" r="67" className="processing-ring" aria-hidden="true"/>}
         {standby ? <g className="standby-content" aria-hidden="true">
-          <g className="flux-mark">
-            <path d="M180 122v17m-7-7 7-7 7 7"/>
-            <path d="M168 140v3.5a2.5 2.5 0 0 0 2.5 2.5h19a2.5 2.5 0 0 0 2.5-2.5V140"/>
-          </g>
-          <text x="180" y="165" textAnchor="middle" className="donut-center-primary">FLUX</text>
-          <text x="180" y="188" textAnchor="middle" className="donut-center-secondary">{dragging ? 'DROP FILE HERE' : 'DROP A FILE'}</text>
-          <text x="180" y="208" textAnchor="middle" className="donut-center-hint">{dragging ? 'RELEASE TO LOAD' : 'CLICK TO BROWSE'}</text>
-          <g className="move-grip" aria-hidden="true">
-            <circle cx="174" cy="225" r="1.6"/><circle cx="180" cy="225" r="1.6"/><circle cx="186" cy="225" r="1.6"/>
-          </g>
-          <text x="180" y="241" textAnchor="middle" className="move-hint">DRAG TO MOVE</text>
-        </g> : <g aria-hidden="true">
-          <text x="180" y="164" textAnchor="middle" className="donut-center-primary">{centerLines[0]}</text>
-          <text x="180" y="187" textAnchor="middle" className="donut-center-secondary">{centerLines[1]}</text>
-          <text x="180" y="210" textAnchor="middle" className="donut-center-hint">{centerLines[2]}</text>
+          <FluxMark className="mark-idle"/>
+          <text x="180" y="211" textAnchor="middle" className="brand-wordmark">FLUX</text>
+        </g> : active ? <g className="active-content" aria-hidden="true">
+          <FluxMark/>
+          <text x="180" y="190" textAnchor="middle" className="brand-wordmark">FLUX</text>
+          <text x="180" y="211" textAnchor="middle" className="center-caption">{count === 1 ? `${item.ext.toUpperCase()} READY` : `${count} FILES READY`}</text>
+        </g> : busy ? <g className="processing-content" aria-hidden="true">
+          <FluxMark/>
+          <text x="180" y="190" textAnchor="middle" className="brand-wordmark">FLUX</text>
+          <text x="180" y="211" textAnchor="middle" className="center-caption">{shorten(status || 'CONVERTING', 15)}</text>
+        </g> : success ? <g className="success-content" aria-hidden="true">
+          <path className="success-check" d="m163 159 12 12 24-27"/>
+          <text x="180" y="194" textAnchor="middle" className="brand-wordmark">FLUX</text>
+          <text x="180" y="214" textAnchor="middle" className="center-caption">SAVED</text>
+        </g> : failed ? <g className="error-content" aria-hidden="true">
+          <path className="error-cross" d="m166 145 28 28m0-28-28 28"/>
+          <text x="180" y="194" textAnchor="middle" className="brand-wordmark">FLUX</text>
+          <text x="180" y="214" textAnchor="middle" className="center-caption">CONVERSION ISSUE</text>
+        </g> : <g className="status-content" aria-hidden="true">
+          <FluxMark/>
+          <text x="180" y="190" textAnchor="middle" className="brand-wordmark">FLUX</text>
+          <text x="180" y="211" textAnchor="middle" className="center-caption">{shorten(status || 'READY', 15)}</text>
         </g>}
       </g>
     </svg>
   </main>;
 }
-

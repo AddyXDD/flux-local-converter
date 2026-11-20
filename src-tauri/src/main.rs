@@ -44,9 +44,23 @@ static DESKTOP_WIDGET_READY: AtomicBool = AtomicBool::new(false);
 
 type OutputSessions = Arc<Mutex<HashMap<String, OutputSession>>>;
 
+#[derive(Default)]
+struct PendingRequest {
+    paths: Vec<String>,
+    target: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingConversion {
+    paths: Vec<String>,
+    target: Option<String>,
+}
+
 struct OutputSession {
     path: String,
     source_path: Option<String>,
+    allow_replace: bool,
     expected_bytes: usize,
     next_offset: usize,
     bytes: Vec<u8>,
@@ -71,6 +85,30 @@ fn replace_output_file(temp: &Path, target: &Path) -> Result<(), std::io::Error>
         )
     }
     .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error.to_string()))
+}
+
+#[cfg(windows)]
+fn move_output_file_new(temp: &Path, target: &Path) -> Result<(), std::io::Error> {
+    use windows::{
+        core::PCWSTR,
+        Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH},
+    };
+
+    let temp: Vec<u16> = temp.as_os_str().encode_wide().chain(Some(0)).collect();
+    let target: Vec<u16> = target.as_os_str().encode_wide().chain(Some(0)).collect();
+    unsafe {
+        MoveFileExW(
+            PCWSTR(temp.as_ptr()),
+            PCWSTR(target.as_ptr()),
+            MOVEFILE_WRITE_THROUGH,
+        )
+    }
+    .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error.to_string()))
+}
+
+#[cfg(not(windows))]
+fn move_output_file_new(temp: &Path, target: &Path) -> Result<(), std::io::Error> {
+    fs::rename(temp, target)
 }
 
 #[cfg(not(windows))]
@@ -101,10 +139,20 @@ fn validate_output_path(path: &str, source_path: Option<&str>) -> Result<(), Str
     Ok(())
 }
 
+#[cfg(test)]
 fn write_output_atomic_blocking(
     path: String,
     source_path: Option<String>,
     bytes: Vec<u8>,
+) -> Result<(), String> {
+    write_output_atomic_blocking_with_policy(path, source_path, bytes, true)
+}
+
+fn write_output_atomic_blocking_with_policy(
+    path: String,
+    source_path: Option<String>,
+    bytes: Vec<u8>,
+    allow_replace: bool,
 ) -> Result<(), String> {
     if bytes.is_empty() {
         return Err("The converter produced an empty file".into());
@@ -189,8 +237,12 @@ fn write_output_atomic_blocking(
             );
         }
         drop(file);
-        replace_output_file(&temp_path, target)
-            .map_err(|e| format!("Could not finalize the output file: {e}"))
+        let result = if allow_replace {
+            replace_output_file(&temp_path, target)
+        } else {
+            move_output_file_new(&temp_path, target)
+        };
+        result.map_err(|e| format!("Could not finalize the output file: {e}"))
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temp_path);
@@ -216,6 +268,7 @@ fn begin_output_write(
     path: String,
     source_path: Option<String>,
     total_bytes: usize,
+    allow_replace: Option<bool>,
     sessions: State<'_, OutputSessions>,
 ) -> Result<String, String> {
     if total_bytes == 0 {
@@ -225,6 +278,12 @@ fn begin_output_write(
         return Err("The converted file is larger than the current safe 32 MB limit".into());
     }
     validate_output_path(&path, source_path.as_deref())?;
+    let allow_replace = allow_replace.unwrap_or(true);
+    if !allow_replace && Path::new(&path).exists() {
+        return Err(
+            "A converted file with that name already exists. Try the conversion again.".into(),
+        );
+    }
 
     let mut active = sessions
         .lock()
@@ -242,6 +301,7 @@ fn begin_output_write(
         OutputSession {
             path,
             source_path,
+            allow_replace,
             expected_bytes: total_bytes,
             next_offset: 0,
             bytes: Vec::new(),
@@ -300,7 +360,12 @@ async fn finish_output_write(
         if session.next_offset != session.expected_bytes {
             return Err("The output transfer ended before all file data arrived".into());
         }
-        write_output_atomic_blocking(session.path, session.source_path, session.bytes)
+        write_output_atomic_blocking_with_policy(
+            session.path,
+            session.source_path,
+            session.bytes,
+            session.allow_replace,
+        )
     })
     .await
     .map_err(|error| format!("Could not finish saving the converted file: {error}"))?
@@ -348,15 +413,60 @@ fn open_converted_file(_path: String) -> Result<(), String> {
     Err("Opening converted files is only available on Windows".into())
 }
 
+#[tauri::command(rename_all = "camelCase")]
+fn unique_output_path(source_path: String, target_extension: String) -> Result<String, String> {
+    let target_extension = target_extension.to_ascii_lowercase();
+    if !matches!(
+        target_extension.as_str(),
+        "png"
+            | "jpg"
+            | "webp"
+            | "bmp"
+            | "pdf"
+            | "docx"
+            | "txt"
+            | "html"
+            | "csv"
+            | "json"
+            | "yaml"
+            | "xml"
+            | "md"
+    ) {
+        return Err("That output format is not supported".into());
+    }
+    let source = Path::new(&source_path);
+    let parent = source
+        .parent()
+        .ok_or("The source file has no parent folder")?;
+    let stem = source
+        .file_stem()
+        .ok_or("The source filename is invalid")?
+        .to_string_lossy();
+    for index in 0..10_000 {
+        let suffix = if index == 0 {
+            " (converted)".to_string()
+        } else {
+            format!(" (converted {index})")
+        };
+        let candidate = parent.join(format!("{stem}{suffix}.{target_extension}"));
+        if !candidate.exists() {
+            return Ok(candidate.to_string_lossy().into_owned());
+        }
+    }
+    Err("Could not find an unused name for the converted file".into())
+}
+
 #[cfg(test)]
 mod output_tests {
     use super::{
-        decode_output_chunk, write_output_atomic_blocking, OutputSessions, BASE64_STANDARD,
-        MAX_OUTPUT_CHUNK_BYTES,
+        context_files, context_target, decode_output_chunk, unique_output_path,
+        write_output_atomic_blocking, write_output_atomic_blocking_with_policy, OutputSessions,
+        PendingRequest, BASE64_STANDARD, MAX_OUTPUT_CHUNK_BYTES,
     };
     use crate::{
+        __cmd__take_pending_conversion, __tauri_command_name_take_pending_conversion,
         abort_output_write, append_output_chunk, begin_output_write, finish_output_write,
-        open_converted_file,
+        open_converted_file, take_pending_conversion,
     };
     use base64::Engine as _;
     use std::{
@@ -413,6 +523,95 @@ mod output_tests {
     }
 
     #[test]
+    fn direct_output_names_avoid_existing_converted_files() {
+        let dir = test_dir();
+        let source = dir.join("report.pdf");
+        fs::write(&source, b"source").expect("seed source file");
+        let first = unique_output_path(source.to_string_lossy().into_owned(), "docx".into())
+            .expect("allocate first output name");
+        assert!(first.ends_with("report (converted).docx"));
+        fs::write(&first, b"keep this file").expect("seed converted output");
+        let second = unique_output_path(source.to_string_lossy().into_owned(), "docx".into())
+            .expect("allocate next output name");
+        assert!(second.ends_with("report (converted 1).docx"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn direct_saves_never_replace_an_existing_file() {
+        let dir = test_dir();
+        let output = dir.join("result.txt");
+        fs::write(&output, b"keep original").expect("seed existing output");
+        assert!(write_output_atomic_blocking_with_policy(
+            output.to_string_lossy().into_owned(),
+            None,
+            b"converted".to_vec(),
+            false,
+        )
+        .is_err());
+        assert_eq!(
+            fs::read(&output).expect("read preserved output"),
+            b"keep original"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn parses_direct_format_and_source_paths_from_shell_arguments() {
+        let args = vec![
+            "flux.exe".into(),
+            "--convert-to".into(),
+            "PDF".into(),
+            "--convert".into(),
+            "C:\\files\\report.docx".into(),
+        ];
+        assert_eq!(context_target(&args).as_deref(), Some("pdf"));
+        assert_eq!(context_files(&args), vec!["C:\\files\\report.docx"]);
+        let invalid = vec![
+            "flux.exe".into(),
+            "--convert-to".into(),
+            "exe".into(),
+            "--convert".into(),
+            "C:\\files\\report.docx".into(),
+        ];
+        assert_eq!(context_target(&invalid), None);
+    }
+
+    #[test]
+    fn passes_direct_conversion_requests_through_tauri_json_ipc_once() {
+        let app = tauri::test::mock_builder()
+            .manage(Mutex::new(PendingRequest {
+                paths: vec!["C:\\files\\report.docx".into()],
+                target: Some("pdf".into()),
+            }))
+            .invoke_handler(tauri::generate_handler![take_pending_conversion])
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("build pending conversion mock app");
+        let window = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .expect("build mock webview window");
+        let response = tauri::test::get_ipc_response(
+            &window,
+            ipc_request("take_pending_conversion", serde_json::json!({})),
+        )
+        .expect("consume pending conversion over JSON IPC")
+        .deserialize::<serde_json::Value>()
+        .expect("decode pending conversion response");
+        assert_eq!(response["target"], "pdf");
+        assert_eq!(response["paths"][0], "C:\\files\\report.docx");
+
+        let next = tauri::test::get_ipc_response(
+            &window,
+            ipc_request("take_pending_conversion", serde_json::json!({})),
+        )
+        .expect("consume empty pending conversion over JSON IPC")
+        .deserialize::<serde_json::Value>()
+        .expect("decode empty pending conversion response");
+        assert_eq!(next["target"], serde_json::Value::Null);
+        assert_eq!(next["paths"].as_array().map(Vec::len), Some(0));
+    }
+
+    #[test]
     fn rejects_invalid_base64_output() {
         assert!(decode_output_chunk("not base64!").is_err());
     }
@@ -452,7 +651,8 @@ mod output_tests {
                 serde_json::json!({
                     "path": output.to_string_lossy(),
                     "sourcePath": null,
-                    "totalBytes": payload.len()
+                    "totalBytes": payload.len(),
+                    "allowReplace": true
                 }),
             ),
         )
@@ -526,6 +726,31 @@ fn context_files(args: &[String]) -> Vec<String> {
         .take_while(|arg| !arg.starts_with("--"))
         .cloned()
         .collect()
+}
+
+fn context_target(args: &[String]) -> Option<String> {
+    if context_files(args).is_empty() {
+        return None;
+    }
+    let index = args.iter().position(|arg| arg == "--convert-to")?;
+    let target = args.get(index + 1)?.to_ascii_lowercase();
+    matches!(
+        target.as_str(),
+        "png"
+            | "jpg"
+            | "webp"
+            | "bmp"
+            | "pdf"
+            | "docx"
+            | "txt"
+            | "html"
+            | "csv"
+            | "json"
+            | "yaml"
+            | "xml"
+            | "md"
+    )
+    .then_some(target)
 }
 
 #[cfg(windows)]
@@ -659,30 +884,55 @@ fn apply_desktop_widget(
 }
 
 #[tauri::command]
-fn take_pending_files(queue: State<'_, Mutex<Vec<String>>>) -> Vec<String> {
+fn take_pending_files(queue: State<'_, Mutex<PendingRequest>>) -> Vec<String> {
     queue
         .lock()
-        .map(|mut paths| std::mem::take(&mut *paths))
+        .map(|mut pending| {
+            pending.target = None;
+            std::mem::take(&mut pending.paths)
+        })
         .unwrap_or_default()
 }
 
+#[tauri::command]
+fn take_pending_conversion(queue: State<'_, Mutex<PendingRequest>>) -> PendingConversion {
+    queue
+        .lock()
+        .map(|mut pending| PendingConversion {
+            paths: std::mem::take(&mut pending.paths),
+            target: pending.target.take(),
+        })
+        .unwrap_or_else(|_| PendingConversion {
+            paths: Vec::new(),
+            target: None,
+        })
+}
+
 fn main() {
-    let initial_files = context_files(&std::env::args().collect::<Vec<_>>());
+    let arguments = std::env::args().collect::<Vec<_>>();
+    let initial_files = context_files(&arguments);
+    let initial_target = context_target(&arguments);
+    let initial_pending = PendingRequest {
+        paths: initial_files,
+        target: initial_target,
+    };
     tauri::Builder::default()
-        .manage(Mutex::new(initial_files))
+        .manage(Mutex::new(initial_pending))
         .manage(Arc::new(Mutex::new(HashMap::new())) as OutputSessions)
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             let files = context_files(&args);
+            let target = context_target(&args);
             if !files.is_empty() {
                 for path in &files {
                     let _ = app.fs_scope().allow_file(path);
                 }
-                if let Ok(mut queue) = app.state::<Mutex<Vec<String>>>().lock() {
-                    queue.extend(files);
+                if let Ok(mut pending) = app.state::<Mutex<PendingRequest>>().lock() {
+                    pending.paths.extend(files);
+                    pending.target = target.clone();
                 }
                 let _ = app.emit("flux:files-pending", ());
             }
-            if DESKTOP_WIDGET_READY.load(Ordering::Acquire) {
+            if target.is_none() && DESKTOP_WIDGET_READY.load(Ordering::Acquire) {
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.show();
                 }
@@ -691,8 +941,8 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .setup(move |app| {
-            if let Ok(paths) = app.state::<Mutex<Vec<String>>>().lock() {
-                for path in paths.iter() {
+            if let Ok(pending) = app.state::<Mutex<PendingRequest>>().lock() {
+                for path in &pending.paths {
                     let _ = app.fs_scope().allow_file(path);
                 }
             }
@@ -760,7 +1010,9 @@ fn main() {
             finish_output_write,
             abort_output_write,
             open_converted_file,
-            take_pending_files
+            unique_output_path,
+            take_pending_files,
+            take_pending_conversion
         ])
         .run(tauri::generate_context!())
         .expect("error while running FLUX");
