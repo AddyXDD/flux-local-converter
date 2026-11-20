@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use std::{
     fs::{self, File, OpenOptions},
     io::Write,
@@ -9,6 +10,9 @@ use std::{
 };
 use tauri::{Emitter, Manager, State};
 use tauri_plugin_fs::FsExt;
+
+const MAX_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
+const MAX_OUTPUT_BASE64_BYTES: usize = MAX_OUTPUT_BYTES.div_ceil(3) * 4;
 
 #[cfg(windows)]
 use windows::{
@@ -66,7 +70,7 @@ fn write_output_atomic_blocking(
     if bytes.is_empty() {
         return Err("The converter produced an empty file".into());
     }
-    if bytes.len() > 32 * 1024 * 1024 {
+    if bytes.len() > MAX_OUTPUT_BYTES {
         return Err("The converted file is larger than the current safe 32 MB limit".into());
     }
     let target = Path::new(&path);
@@ -169,9 +173,28 @@ fn write_output_atomic_blocking(
     result
 }
 
+fn decode_output_base64(value: &str) -> Result<Vec<u8>, String> {
+    if value.len() > MAX_OUTPUT_BASE64_BYTES {
+        return Err("The converted file is larger than the current safe 32 MB limit".into());
+    }
+    let bytes = BASE64_STANDARD
+        .decode(value)
+        .map_err(|_| "The converted file payload was not valid Base64")?;
+    if bytes.is_empty() {
+        return Err("The converter produced an empty file".into());
+    }
+    if bytes.len() > MAX_OUTPUT_BYTES {
+        return Err("The converted file is larger than the current safe 32 MB limit".into());
+    }
+    Ok(bytes)
+}
+
 #[cfg(test)]
 mod output_tests {
-    use super::write_output_atomic_blocking;
+    use super::{decode_output_base64, write_output_atomic_blocking};
+    use crate::{
+        __cmd__write_output_atomic, __tauri_command_name_write_output_atomic, write_output_atomic,
+    };
     use std::{
         fs,
         path::PathBuf,
@@ -220,29 +243,53 @@ mod output_tests {
         );
         let _ = fs::remove_dir_all(dir);
     }
-}
 
-fn decode_ipc_header(value: &str) -> Result<String, String> {
-    let mut bytes = Vec::with_capacity(value.len());
-    let input = value.as_bytes();
-    let mut index = 0;
-    while index < input.len() {
-        if input[index] == b'%' {
-            if index + 2 >= input.len() {
-                return Err("The output path header is malformed".into());
-            }
-            let hex = std::str::from_utf8(&input[index + 1..index + 3])
-                .map_err(|_| "The output path header is malformed")?;
-            bytes.push(
-                u8::from_str_radix(hex, 16).map_err(|_| "The output path header is malformed")?,
-            );
-            index += 3;
-        } else {
-            bytes.push(input[index]);
-            index += 1;
-        }
+    #[test]
+    fn decodes_base64_export_and_writes_the_original_bytes() {
+        let dir = test_dir();
+        let output = dir.join("result.txt");
+        let bytes = decode_output_base64("Y29udmVydGVk").expect("decode export bytes");
+        write_output_atomic_blocking(output.to_string_lossy().into_owned(), None, bytes)
+            .expect("write decoded export");
+        assert_eq!(fs::read(&output).expect("read result"), b"converted");
+        let _ = fs::remove_dir_all(dir);
     }
-    String::from_utf8(bytes).map_err(|_| "The output path is not valid UTF-8".into())
+
+    #[test]
+    fn rejects_invalid_base64_output() {
+        assert!(decode_output_base64("not base64!").is_err());
+    }
+
+    #[test]
+    fn writes_export_through_tauri_json_ipc() {
+        let dir = test_dir();
+        let output = dir.join("ipc-result.txt");
+        let app = tauri::test::mock_builder()
+            .invoke_handler(tauri::generate_handler![write_output_atomic])
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("build mock Tauri app");
+        let window = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .expect("build mock webview window");
+        let request = tauri::webview::InvokeRequest {
+            cmd: "write_output_atomic".into(),
+            callback: tauri::ipc::CallbackFn(0),
+            error: tauri::ipc::CallbackFn(1),
+            url: "http://tauri.localhost".parse().expect("parse Tauri URL"),
+            body: tauri::ipc::InvokeBody::Json(serde_json::json!({
+                "path": output.to_string_lossy(),
+                "sourcePath": null,
+                "dataBase64": "Y29udmVydGVk"
+            })),
+            headers: Default::default(),
+            invoke_key: tauri::test::INVOKE_KEY.to_string(),
+        };
+
+        let response = tauri::test::get_ipc_response(&window, request);
+        assert!(response.is_ok(), "JSON IPC export failed: {response:?}");
+        assert_eq!(fs::read(&output).expect("read IPC export"), b"converted");
+        let _ = fs::remove_dir_all(dir);
+    }
 }
 
 fn write_startup_log(message: &str) {
@@ -263,31 +310,14 @@ fn write_startup_log(message: &str) {
     }
 }
 
-#[tauri::command]
-async fn write_output_atomic(request: tauri::ipc::Request<'_>) -> Result<(), String> {
-    let header = |name: &str| -> Result<String, String> {
-        let value = request
-            .headers()
-            .get(name)
-            .ok_or_else(|| format!("The output request is missing its {name} header"))?
-            .to_str()
-            .map_err(|_| format!("The output request has an invalid {name} header"))?;
-        decode_ipc_header(value)
-    };
-    let path = header("path")?;
-    let source = header("source-path")?;
-    let source_path = if source.is_empty() {
-        None
-    } else {
-        Some(source)
-    };
-    let bytes = match request.body() {
-        tauri::ipc::InvokeBody::Raw(bytes) => bytes.clone(),
-        tauri::ipc::InvokeBody::Json(_) => {
-            return Err("The output request did not contain binary file data".into())
-        }
-    };
+#[tauri::command(rename_all = "camelCase")]
+async fn write_output_atomic(
+    path: String,
+    source_path: Option<String>,
+    data_base64: String,
+) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
+        let bytes = decode_output_base64(&data_base64)?;
         write_output_atomic_blocking(path, source_path, bytes)
     })
     .await

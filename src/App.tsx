@@ -20,6 +20,26 @@ function errorMessage(cause: unknown, fallback: string) {
   return fallback;
 }
 
+function blobToBase64(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error ?? new Error('Could not prepare the converted file for saving.'));
+    reader.onload = () => {
+      if (typeof reader.result !== 'string') {
+        reject(new Error('Could not prepare the converted file for saving.'));
+        return;
+      }
+      const separator = reader.result.indexOf(',');
+      if (separator < 0) {
+        reject(new Error('Could not prepare the converted file for saving.'));
+        return;
+      }
+      resolve(reader.result.slice(separator + 1));
+    };
+    reader.readAsDataURL(blob);
+  });
+}
+
 export default function App() {
   const [files, setFiles] = useState<FluxFile[]>([]);
   const [busy, setBusy] = useState(false);
@@ -229,11 +249,12 @@ export default function App() {
         if (blob.size > 32 * 1024 * 1024) throw new Error('Converted output exceeds the safe 32 MB limit.');
         if (isTauri()) {
           if (!outputPath) throw new Error('No output location was selected.');
-          const bytes = new Uint8Array(await blob.arrayBuffer());
-          await invoke('write_output_atomic', bytes, { headers: {
-            path: encodeURIComponent(outputPath),
-            'source-path': encodeURIComponent(file.sourcePath ?? ''),
-          } });
+          const dataBase64 = await blobToBase64(blob);
+          await invoke('write_output_atomic', {
+            path: outputPath,
+            sourcePath: file.sourcePath ?? null,
+            dataBase64,
+          });
         } else {
           const url = URL.createObjectURL(blob);
           const anchor = document.createElement('a');
