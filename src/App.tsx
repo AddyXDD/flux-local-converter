@@ -10,6 +10,16 @@ import { readFile, stat } from '@tauri-apps/plugin-fs';
 import { convert, detect, outputName, targetsFor, type FluxFile } from './converter';
 import FormatWheel from './FormatWheel';
 
+function errorMessage(cause: unknown, fallback: string) {
+  if (cause instanceof Error && cause.message) return cause.message;
+  if (typeof cause === 'string' && cause) return cause;
+  if (cause && typeof cause === 'object' && 'message' in cause) {
+    const message = (cause as { message?: unknown }).message;
+    if (typeof message === 'string' && message) return message;
+  }
+  return fallback;
+}
+
 export default function App() {
   const [files, setFiles] = useState<FluxFile[]>([]);
   const [busy, setBusy] = useState(false);
@@ -174,7 +184,7 @@ export default function App() {
       } catch (cause) {
         if (mounted) {
           setStatus('FILE COULD NOT OPEN');
-          setError(cause instanceof Error ? cause.message : 'Could not open the selected file.');
+          setError(errorMessage(cause, 'Could not open the selected file.'));
         }
       }
     };
@@ -235,7 +245,7 @@ export default function App() {
         successes.push(name);
       } catch (cause) {
         if (controller.signal.aborted || (cause instanceof Error && cause.name === 'AbortError')) break;
-        failures.push(`${file.file.name}: ${cause instanceof Error ? cause.message : 'conversion failed'}`);
+        failures.push(`${file.file.name}: ${errorMessage(cause, 'conversion failed')}`);
       }
     }
     if (successes.length) {

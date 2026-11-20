@@ -26,8 +26,37 @@ use windows::{
     },
 };
 
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+
 static TEMP_ID: AtomicU64 = AtomicU64::new(0);
 static DESKTOP_WIDGET_READY: AtomicBool = AtomicBool::new(false);
+
+#[cfg(windows)]
+fn replace_output_file(temp: &Path, target: &Path) -> Result<(), std::io::Error> {
+    use windows::{
+        core::PCWSTR,
+        Win32::Storage::FileSystem::{
+            MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+        },
+    };
+
+    let temp: Vec<u16> = temp.as_os_str().encode_wide().chain(Some(0)).collect();
+    let target: Vec<u16> = target.as_os_str().encode_wide().chain(Some(0)).collect();
+    unsafe {
+        MoveFileExW(
+            PCWSTR(temp.as_ptr()),
+            PCWSTR(target.as_ptr()),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    }
+    .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error.to_string()))
+}
+
+#[cfg(not(windows))]
+fn replace_output_file(temp: &Path, target: &Path) -> Result<(), std::io::Error> {
+    fs::rename(temp, target)
+}
 
 fn write_output_atomic_blocking(
     path: String,
@@ -131,13 +160,66 @@ fn write_output_atomic_blocking(
             );
         }
         drop(file);
-        fs::rename(&temp_path, target)
+        replace_output_file(&temp_path, target)
             .map_err(|e| format!("Could not finalize the output file: {e}"))
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temp_path);
     }
     result
+}
+
+#[cfg(test)]
+mod output_tests {
+    use super::write_output_atomic_blocking;
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    static TEST_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn test_dir() -> PathBuf {
+        let id = TEST_ID.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("flux-output-test-{}-{id}", std::process::id()));
+        fs::create_dir_all(&path).expect("create isolated test directory");
+        path
+    }
+
+    #[test]
+    fn writes_new_output() {
+        let dir = test_dir();
+        let output = dir.join("result.txt");
+        write_output_atomic_blocking(
+            output.to_string_lossy().into_owned(),
+            None,
+            b"converted".to_vec(),
+        )
+        .expect("first export should succeed");
+        assert_eq!(fs::read(&output).expect("read result"), b"converted");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn replaces_existing_output_and_removes_the_temporary_file() {
+        let dir = test_dir();
+        let output = dir.join("result.txt");
+        fs::write(&output, b"older export").expect("seed existing output");
+        write_output_atomic_blocking(
+            output.to_string_lossy().into_owned(),
+            None,
+            b"new export".to_vec(),
+        )
+        .expect("repeat export should replace the prior result");
+        assert_eq!(fs::read(&output).expect("read result"), b"new export");
+        assert_eq!(
+            fs::read_dir(&dir).expect("list result directory").count(),
+            1
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
 }
 
 fn decode_ipc_header(value: &str) -> Result<String, String> {

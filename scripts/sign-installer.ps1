@@ -11,17 +11,29 @@ $outputDirectory = Join-Path $root 'outputs'
 $offlineInstaller = Join-Path $outputDirectory 'FLUX-Setup-Offline.exe'
 $versionedInstaller = Join-Path $outputDirectory "FLUX_${version}_x64-setup.exe"
 $hashFile = Join-Path $outputDirectory 'FLUX-Setup-Offline.sha256'
-$pfx = Join-Path $env:LOCALAPPDATA 'FLUX-Shell-Extension-Signing\FluxLocalConverterShell.pfx'
+$pfx = if ([string]::IsNullOrWhiteSpace($env:FLUX_SHELL_SIGNING_PFX_PATH)) {
+  Join-Path $env:LOCALAPPDATA 'FLUX-Shell-Extension-Signing\FluxLocalConverterShell.pfx'
+} else {
+  [System.IO.Path]::GetFullPath($env:FLUX_SHELL_SIGNING_PFX_PATH)
+}
 $certificatePath = Join-Path $env:LOCALAPPDATA 'FLUX-Shell-Extension-Signing\FluxLocalConverterShell.cer'
 $password = $env:FLUX_SHELL_SIGNING_PASSWORD
+$storeThumbprint = $env:FLUX_SHELL_SIGNING_THUMBPRINT
+$signWithStore = -not [string]::IsNullOrWhiteSpace($storeThumbprint)
 $winapp = Join-Path $root 'node_modules\.bin\winapp.cmd'
+$storeSigner = Join-Path $root 'scripts\sign-with-store.ps1'
 
-if ([string]::IsNullOrWhiteSpace($password)) { throw 'Set FLUX_SHELL_SIGNING_PASSWORD to sign the Windows installer.' }
-foreach ($path in @($installer, $shellExtension, $sparsePackage, $pfx, $certificatePath, $winapp)) {
+if (-not $signWithStore -and [string]::IsNullOrWhiteSpace($password)) { throw 'Set FLUX_SHELL_SIGNING_PASSWORD or FLUX_SHELL_SIGNING_THUMBPRINT to sign the Windows installer.' }
+$requiredFiles = @($installer, $shellExtension, $sparsePackage, $certificatePath, $winapp)
+if ($signWithStore) { $requiredFiles += $storeSigner } else { $requiredFiles += $pfx }
+foreach ($path in $requiredFiles) {
   if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Required installer-signing input is missing: $path" }
 }
 
 $certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($certificatePath)
+if ($signWithStore -and $certificate.Thumbprint -ne ($storeThumbprint -replace '\s', '').ToUpperInvariant()) {
+  throw 'The requested signer does not match the FLUX package certificate.'
+}
 function Assert-FluxSignature([string] $Path) {
   $previousErrorAction = $ErrorActionPreference
   try {
@@ -43,8 +55,12 @@ foreach ($path in @($shellExtension, $sparsePackage, $installer)) {
   Assert-FluxSignature $path
 }
 
-& $winapp sign $installer $pfx --password $password
-if ($LASTEXITCODE -ne 0) { throw "Could not sign the FLUX installer (WinApp CLI exit $LASTEXITCODE)." }
+if ($signWithStore) {
+  & $storeSigner -FilePath $installer -Thumbprint $certificate.Thumbprint
+} else {
+  & $winapp sign $installer $pfx --password $password
+  if ($LASTEXITCODE -ne 0) { throw "Could not sign the FLUX installer (WinApp CLI exit $LASTEXITCODE)." }
+}
 Assert-FluxSignature $installer
 Copy-Item -LiteralPath $installer -Destination $offlineInstaller -Force
 Copy-Item -LiteralPath $installer -Destination $versionedInstaller -Force

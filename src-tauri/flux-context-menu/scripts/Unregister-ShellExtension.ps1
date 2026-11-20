@@ -13,7 +13,34 @@ function Write-Log([string] $Message) {
   Add-Content -LiteralPath $logPath -Value "$(Get-Date -Format o) $Message" -Encoding UTF8
 }
 
+function Stop-InstalledFlux {
+  $expectedPath = [System.IO.Path]::GetFullPath((Join-Path $InstallRoot 'flux.exe'))
+  foreach ($process in @(Get-Process -Name 'flux' -ErrorAction SilentlyContinue)) {
+    try {
+      if (-not $process.Path -or [System.IO.Path]::GetFullPath($process.Path) -ine $expectedPath) { continue }
+      $processId = $process.Id
+      if ($process.MainWindowHandle -ne [IntPtr]::Zero) {
+        [void] $process.CloseMainWindow()
+        if ($process.WaitForExit(2500)) {
+          Write-Log "Closed FLUX desktop process $processId before uninstall."
+          continue
+        }
+      }
+      if (-not $process.HasExited) {
+        $process.Kill()
+        if (-not $process.WaitForExit(5000)) { throw "FLUX process $processId did not exit." }
+      }
+      Write-Log "Stopped FLUX desktop process $processId before uninstall."
+    }
+    catch {
+      Write-Log "Could not stop FLUX desktop process $($process.Id) cleanly: $($_.Exception.Message)"
+    }
+  }
+}
+
 try {
+  $InstallRoot = [System.IO.Path]::GetFullPath($InstallRoot).TrimEnd('\')
+  Stop-InstalledFlux
   $packages = @(Get-AppxPackage -Name 'FluxLocalConverterShell' -ErrorAction SilentlyContinue)
   foreach ($package in $packages) {
     Remove-AppxPackage -Package $package.PackageFullName -ErrorAction Stop
